@@ -2701,52 +2701,65 @@ ${utiDecls}
 						);
 					}
 				}
-			} else if (targetOS === "linux" && config.build.linux?.icon) {
-				const iconSourcePath = join(projectRoot, config.build.linux.icon);
-				if (existsSync(iconSourcePath)) {
-					const standardIconPath = join(
-						appBundleFolderResourcesPath,
-						"appIcon.png",
-					);
+			} else if (targetOS === "linux") {
+				// Copy the configured Linux icon, if one is set. The desktop file below is
+				// written regardless, because it also carries deep-link scheme registration.
+				if (config.build.linux?.icon) {
+					const iconSourcePath = join(projectRoot, config.build.linux.icon);
+					if (existsSync(iconSourcePath)) {
+						const standardIconPath = join(
+							appBundleFolderResourcesPath,
+							"appIcon.png",
+						);
 
-					// Ensure Resources directory exists
-					mkdirSync(appBundleFolderResourcesPath, { recursive: true });
+						// Ensure Resources directory exists
+						mkdirSync(appBundleFolderResourcesPath, { recursive: true });
 
-					// Copy the icon to standard location
-					cpSync(iconSourcePath, standardIconPath, { dereference: true });
-					console.log(
-						`Copied Linux icon from ${iconSourcePath} to ${standardIconPath}`,
-					);
+						// Copy the icon to standard location
+						cpSync(iconSourcePath, standardIconPath, { dereference: true });
+						console.log(
+							`Copied Linux icon from ${iconSourcePath} to ${standardIconPath}`,
+						);
 
-					// Also copy icon for the extractor (expects it in Resources/app/icon.png before ASAR packaging)
-					const extractorIconPath = join(
-						appBundleFolderResourcesPath,
-						"app",
-						"icon.png",
-					);
-					mkdirSync(join(appBundleFolderResourcesPath, "app"), {
-						recursive: true,
-					});
-					cpSync(iconSourcePath, extractorIconPath, { dereference: true });
-					console.log(
-						`Copied Linux icon for extractor from ${iconSourcePath} to ${extractorIconPath}`,
-					);
-				} else {
-					console.log(`WARNING: Linux icon not found: ${iconSourcePath}`);
+						// Also copy icon for the extractor (expects it in Resources/app/icon.png before ASAR packaging)
+						const extractorIconPath = join(
+							appBundleFolderResourcesPath,
+							"app",
+							"icon.png",
+						);
+						mkdirSync(join(appBundleFolderResourcesPath, "app"), {
+							recursive: true,
+						});
+						cpSync(iconSourcePath, extractorIconPath, { dereference: true });
+						console.log(
+							`Copied Linux icon for extractor from ${iconSourcePath} to ${extractorIconPath}`,
+						);
+					} else {
+						console.log(`WARNING: Linux icon not found: ${iconSourcePath}`);
+					}
 				}
 
-				// Create desktop file template for Linux
+				// Create desktop file template for Linux. Written for every Linux build (not
+				// just when an icon is set) because it also registers custom URL schemes for
+				// deep linking via MimeType=x-scheme-handler/<scheme> and passes the launched
+				// URL to the app through the `%u` field code in Exec.
+				const schemeMimeTypes = (config.app.urlSchemes ?? [])
+					.map((scheme: string) => `x-scheme-handler/${scheme}`)
+					.join(";");
+				const mimeTypeLine = schemeMimeTypes
+					? `MimeType=${schemeMimeTypes};\n`
+					: "";
 				const desktopContent = `[Desktop Entry]
 Version=1.0
 Type=Application
 Name=${config.app.name}
 Comment=${config.app.description || `${config.app.name} application`}
-Exec=launcher
+Exec=launcher %u
 Icon=appIcon.png
 Terminal=false
 StartupWMClass=${config.app.name}
 Categories=Utility;Application;
-`;
+${mimeTypeLine}`;
 
 				const desktopFilePath = join(
 					appBundleFolderPath,
@@ -4167,6 +4180,15 @@ usageDescriptions : ""}${urlTypes ? "\n" + urlTypes : ""}${documentTypes ?
 			baseUrl: config.release.baseUrl,
 			name: appFileName,
 			identifier: config.app.identifier,
+			// Custom URL schemes for deep linking. The launcher reads these to recognize
+			// a deep-link argv element on Windows/Linux (cold launch) and to decide whether
+			// to enforce single-instance forwarding.
+			urlSchemes: config.app.urlSchemes ?? [],
+			// Whether the launcher enforces single-instance behavior (Windows/Linux). Defaults
+			// to enabled when urlSchemes are set so deep links reach an already-running app.
+			singleInstance:
+				config.app.singleInstance ??
+				(config.app.urlSchemes ?? []).length > 0,
 		});
 
 		await Bun.write(

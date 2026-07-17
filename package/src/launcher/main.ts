@@ -13,12 +13,44 @@ const coreLibFileName =
 const coreLibPath = join(pathToMacOS, coreLibFileName);
 const absoluteCoreLibPath = resolve(coreLibPath);
 
+// Maximum accepted length for a deep-link URL (defense against oversized argv input).
+const MAX_DEEP_LINK_URL_LENGTH = 8 * 1024;
+
+// Extract a deep-link URL from process arguments (cold launch on Windows/Linux).
+// On Windows the OS invokes `"<launcher.exe>" "%1"` from the registry; on Linux it
+// invokes `launcher %u` from the .desktop file — in both cases the URL is a single argv
+// element. Returns the first argument whose scheme matches one of the app's registered
+// urlSchemes. The URL is treated as untrusted: only a registered scheme is accepted, the
+// length is bounded, and control characters are rejected before it is handed to the app.
+function extractDeepLinkFromArgv(
+	argv: string[],
+	urlSchemes: string[],
+): string | null {
+	if (!urlSchemes || urlSchemes.length === 0) return null;
+	const registered = new Set(urlSchemes.map((s) => s.toLowerCase()));
+	// argv[0] is the launcher executable; user-supplied arguments follow.
+	for (let i = 1; i < argv.length; i++) {
+		const arg = argv[i];
+		if (!arg || arg.length > MAX_DEEP_LINK_URL_LENGTH) continue;
+		// eslint-disable-next-line no-control-regex
+		if (/[\u0000-\u001f\u007f]/.test(arg)) continue;
+		const match = arg.match(/^([a-zA-Z][a-zA-Z0-9+.\-]*):\/\//);
+		if (!match) continue;
+		if (registered.has(match[1]!.toLowerCase())) {
+			return arg;
+		}
+	}
+	return null;
+}
+
 // Wrap main logic in a function to avoid top-level return
 function main() {
 	// Read version.json early to get identifier, name, and channel for CEF initialization
 	let channel = "";
 	let identifier = "";
 	let name = "";
+	let urlSchemes: string[] = [];
+	let singleInstance = false;
 	try {
 		const pathToLauncherBin = process.argv0;
 		const pathToBinDir = dirname(pathToLauncherBin);
@@ -39,6 +71,14 @@ function main() {
 			}
 			if (versionInfo.channel) {
 				channel = versionInfo.channel;
+			}
+			if (Array.isArray(versionInfo.urlSchemes)) {
+				urlSchemes = versionInfo.urlSchemes.filter(
+					(s: unknown): s is string => typeof s === "string",
+				);
+			}
+			if (typeof versionInfo.singleInstance === "boolean") {
+				singleInstance = versionInfo.singleInstance;
 			}
 			console.log(
 				`[LAUNCHER] Loaded identifier: ${identifier}, name: ${name}, channel: ${channel}`,
@@ -79,6 +119,40 @@ function main() {
 		}
 	}
 
+	// FFI surface of libElectrobunCore that the launcher needs. Deep-link + single-instance
+	// entry points are forwarded by the core shim to libNativeWrapper (see core/main.zig).
+	const coreSymbols = {
+		electrobun_core_run_main_thread: {
+			args: ["cstring", "cstring", "cstring", "i32"],
+			returns: "i32",
+		},
+		electrobun_core_last_error: {
+			args: [],
+			returns: "cstring",
+		},
+		// Cold-launch deep link: hand a URL received as an argv element to the native
+		// wrapper, which buffers it until the Bun worker registers its open-url handler.
+		electrobun_set_launch_url: {
+			args: ["cstring"],
+			returns: "void",
+		},
+		// First-run deep-link registration (Windows registry). No-op on other platforms.
+		electrobun_register_url_schemes: {
+			args: ["cstring", "cstring"],
+			returns: "void",
+		},
+		// Single-instance: acquire returns true for the primary (first) instance, false for
+		// a secondary. send_url forwards a deep-link URL from a secondary to the primary.
+		electrobun_single_instance_acquire: {
+			args: ["cstring"],
+			returns: "bool",
+		},
+		electrobun_single_instance_send_url: {
+			args: ["cstring", "cstring"],
+			returns: "void",
+		},
+	} as const;
+
 	let lib;
 	try {
 		// Set LD_LIBRARY_PATH if not already set
@@ -87,16 +161,7 @@ function main() {
 				`.${process.env["LD_LIBRARY_PATH"] ? ":" + process.env["LD_LIBRARY_PATH"] : ""}`;
 		}
 
-		lib = dlopen(coreLibPath, {
-			electrobun_core_run_main_thread: {
-				args: ["cstring", "cstring", "cstring", "i32"],
-				returns: "i32",
-			},
-			electrobun_core_last_error: {
-				args: [],
-				returns: "cstring",
-			},
-		});
+		lib = dlopen(coreLibPath, coreSymbols);
 	} catch (error) {
 		console.error(
 			`[LAUNCHER] Failed to load ElectrobunCore: ${(error as Error).message}`,
@@ -104,21 +169,42 @@ function main() {
 
 		// Try with absolute path as fallback
 		try {
-			lib = dlopen(absoluteCoreLibPath, {
-				electrobun_core_run_main_thread: {
-					args: ["cstring", "cstring", "cstring", "i32"],
-					returns: "i32",
-				},
-				electrobun_core_last_error: {
-					args: [],
-					returns: "cstring",
-				},
-			});
+			lib = dlopen(absoluteCoreLibPath, coreSymbols);
 		} catch (absError) {
 			console.error(
 				`[LAUNCHER] Core library loading failed. Try running: ldd ${coreLibPath}`,
 			);
 			throw error;
+		}
+	}
+
+	// Single-instance + warm-launch deep-link forwarding (Windows/Linux).
+	// If another instance already holds the lock, this is a secondary launch: forward any
+	// deep-link URL from our arguments to the running instance (delivered there via the
+	// "open-url" event) and exit without opening a second window. macOS is inherently
+	// single-instance for bundled apps and routes deep links via the OS, so it is skipped.
+	if (process.platform !== "darwin" && singleInstance) {
+		const instanceKey = `electrobun.${identifier}.${channel}`;
+		const instanceKeyPtr = ptr(
+			new Uint8Array(Buffer.from(instanceKey + "\0", "utf8")),
+		);
+		const isPrimary = lib.symbols.electrobun_single_instance_acquire(
+			instanceKeyPtr,
+		);
+		if (!isPrimary) {
+			const forwardUrl = extractDeepLinkFromArgv(process.argv, urlSchemes);
+			if (forwardUrl) {
+				console.log(`[LAUNCHER] Forwarding deep link to running instance`);
+				lib.symbols.electrobun_single_instance_send_url(
+					ptr(new Uint8Array(Buffer.from(instanceKey + "\0", "utf8"))),
+					ptr(new Uint8Array(Buffer.from(forwardUrl + "\0", "utf8"))),
+				);
+			} else {
+				console.log(
+					`[LAUNCHER] Another instance is already running; exiting`,
+				);
+			}
+			process.exit(0);
 		}
 	}
 
@@ -242,6 +328,35 @@ ${fileData.toString("utf8")}
 	// Without these, SIGINT kills the process before the worker can run beforeQuit.
 	process.on("SIGINT", () => {});
 	process.on("SIGTERM", () => {});
+
+	// First-run deep-link registration (Windows): register custom URL schemes in the
+	// registry so the OS routes `<scheme>://` links to this app. Idempotent and self-healing
+	// (uses the current launcher path). macOS registers via Info.plist at build time; Linux
+	// registers at install time via the .desktop file + xdg-mime.
+	if (process.platform === "win32" && urlSchemes.length > 0) {
+		try {
+			lib.symbols.electrobun_register_url_schemes(
+				ptr(new Uint8Array(Buffer.from(urlSchemes.join(",") + "\0", "utf8"))),
+				ptr(new Uint8Array(Buffer.from(process.execPath + "\0", "utf8"))),
+			);
+		} catch (err) {
+			console.error(`[LAUNCHER] URL scheme registration failed:`, err);
+		}
+	}
+
+	// Cold-launch deep link (Windows/Linux): if the OS launched us with a registered
+	// scheme URL as an argument, hand it to the native wrapper. It is buffered there and
+	// delivered to the app's "open-url" listener once the worker registers its handler.
+	// macOS receives deep links through the app delegate (application:openURLs:) instead.
+	if (process.platform !== "darwin") {
+		const launchUrl = extractDeepLinkFromArgv(process.argv, urlSchemes);
+		if (launchUrl) {
+			console.log(`[LAUNCHER] Cold-launch deep link received`);
+			lib.symbols.electrobun_set_launch_url(
+				ptr(new Uint8Array(Buffer.from(launchUrl + "\0", "utf8"))),
+			);
+		}
+	}
 
 	new Worker(appEntrypointPath, {
 		// consider adding a preload with error handling

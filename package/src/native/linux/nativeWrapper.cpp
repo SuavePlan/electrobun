@@ -27,6 +27,10 @@
 #include <atomic>
 #include <chrono>
 #include <unistd.h>
+#include <sys/socket.h>
+#include <sys/un.h>
+#include <cerrno>
+#include <cstddef>
 #include <functional>
 #include <execinfo.h>
 #include <cmath>
@@ -64,6 +68,30 @@
 #include "../shared/cache_migration.h"
 
 using namespace electrobun;
+
+// ============================================================================
+// Deep-link (custom URL scheme) delivery
+// ----------------------------------------------------------------------------
+// Mirrors the macOS implementation in macos/nativeWrapper.mm. The Bun worker
+// registers a handler via setURLOpenHandler(); URLs that arrive before it is
+// ready (cold launch) are buffered and flushed on registration. Cold-launch
+// argv URLs (electrobun_set_launch_url) and warm-launch URLs forwarded from a
+// second instance both funnel through deliverUrlToHandlerOrBuffer().
+// ============================================================================
+static URLOpenHandler g_urlOpenHandler = nullptr;
+static std::vector<std::string> g_pendingUrlOpenPaths;
+static std::mutex g_urlOpenMutex;
+
+static void deliverUrlToHandlerOrBuffer(const char* url) {
+    if (!url) return;
+    std::lock_guard<std::mutex> lock(g_urlOpenMutex);
+    if (g_urlOpenHandler) {
+        g_urlOpenHandler(url);
+    } else {
+        // Handler not registered yet — buffer it; setURLOpenHandler flushes on registration.
+        g_pendingUrlOpenPaths.emplace_back(url);
+    }
+}
 
 // Global ASAR archive handle (lazy-loaded) with thread-safe initialization
 // ASAR C FFI declarations are in shared/asar.h
@@ -11715,10 +11743,143 @@ ELECTROBUN_EXPORT void sessionClearStorageData(const char* partitionIdentifier, 
     });
 }
 
+// setURLOpenHandler - registers the deep-link handler and flushes any URLs that
+// arrived before registration (cold-launch buffer). Mirrors macos/nativeWrapper.mm:8252.
 ELECTROBUN_EXPORT void setURLOpenHandler(void (*callback)(const char*)) {
-    (void)callback;
-    // Not supported on Linux - stub to prevent dlopen failure
-    // Linux URL protocol handling is done via desktop file associations
+    std::vector<std::string> pending;
+    {
+        std::lock_guard<std::mutex> lock(g_urlOpenMutex);
+        g_urlOpenHandler = callback;
+        pending = std::move(g_pendingUrlOpenPaths);
+    }
+    // Deliver outside the lock to avoid holding it during the FFI call into Bun.
+    for (const auto& url : pending) {
+        callback(url.c_str());
+    }
+}
+
+// electrobun_set_launch_url - called by the launcher for a cold-launch deep link,
+// where the URL arrives as an argv element (from the .desktop `%u` field) rather than
+// through an OS event. Buffered/delivered via the same path as macOS's cold-launch buffer.
+ELECTROBUN_EXPORT void electrobun_set_launch_url(const char* url) {
+    deliverUrlToHandlerOrBuffer(url);
+}
+
+// electrobun_register_url_schemes - on Linux, custom URL schemes are registered at
+// install time by the self-extractor (which writes a .desktop MimeType=x-scheme-handler
+// entry and runs `xdg-mime default`). This export exists for API symmetry with Windows;
+// the launcher does not call it on Linux, so it is a no-op.
+ELECTROBUN_EXPORT void electrobun_register_url_schemes(const char* schemesCsv, const char* launcherPath) {
+    (void)schemesCsv;
+    (void)launcherPath;
+}
+
+// ============================================================================
+// Single-instance / warm-launch deep-link forwarding (Linux)
+// ----------------------------------------------------------------------------
+// The primary instance binds an abstract-namespace unix domain socket (keyed by the app
+// identifier + channel) and accepts connections on the glib main loop. A secondary launch
+// connects, writes its deep-link URL, and exits; the primary routes the URL through
+// deliverUrlToHandlerOrBuffer() (delivered to the app as an "open-url" event). Abstract
+// sockets auto-release on process exit, so there are no stale lock files to clean up.
+// ============================================================================
+static constexpr size_t MAX_DEEP_LINK_URL_BYTES = 8 * 1024;
+static int g_singleInstanceSocketFd = -1;
+
+// Fill a sockaddr_un for the abstract-namespace address derived from instanceKey.
+// Returns the address length to pass to bind()/connect().
+static socklen_t buildAbstractSockAddr(struct sockaddr_un* addr, const char* instanceKey) {
+    memset(addr, 0, sizeof(*addr));
+    addr->sun_family = AF_UNIX;
+    size_t keylen = strlen(instanceKey);
+    const size_t maxlen = sizeof(addr->sun_path) - 1; // room for the leading NUL
+    if (keylen > maxlen) keylen = maxlen;
+    addr->sun_path[0] = '\0'; // abstract namespace is signalled by a leading NUL
+    memcpy(addr->sun_path + 1, instanceKey, keylen);
+    return static_cast<socklen_t>(offsetof(struct sockaddr_un, sun_path) + 1 + keylen);
+}
+
+static gboolean onSingleInstanceConnection(GIOChannel* source, GIOCondition condition, gpointer data) {
+    (void)data;
+    if (condition & (G_IO_HUP | G_IO_ERR | G_IO_NVAL)) {
+        return TRUE; // transient; keep the watch alive
+    }
+    const int listen_fd = g_io_channel_unix_get_fd(source);
+    const int client_fd = accept(listen_fd, nullptr, nullptr);
+    if (client_fd < 0) return TRUE;
+
+    char buf[MAX_DEEP_LINK_URL_BYTES];
+    size_t total = 0;
+    while (total < sizeof(buf) - 1) {
+        const ssize_t n = read(client_fd, buf + total, sizeof(buf) - 1 - total);
+        if (n <= 0) break;
+        total += static_cast<size_t>(n);
+        if (memchr(buf, '\n', total)) break;
+    }
+    close(client_fd);
+
+    if (total > 0) {
+        buf[total] = '\0';
+        char* nl = static_cast<char*>(memchr(buf, '\n', total));
+        if (nl) *nl = '\0';
+        deliverUrlToHandlerOrBuffer(buf);
+    }
+    return TRUE; // keep watching for further connections
+}
+
+// Returns true if this is the primary instance (and starts listening for forwarded URLs),
+// false if another instance already holds the lock. Fails open (returns true) on any error.
+ELECTROBUN_EXPORT bool electrobun_single_instance_acquire(const char* instanceKey) {
+    if (!instanceKey) return true;
+    const int fd = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (fd < 0) return true; // fail open
+
+    struct sockaddr_un addr;
+    const socklen_t addrlen = buildAbstractSockAddr(&addr, instanceKey);
+
+    if (bind(fd, reinterpret_cast<struct sockaddr*>(&addr), addrlen) < 0) {
+        if (errno == EADDRINUSE) { close(fd); return false; } // secondary
+        close(fd);
+        return true; // other error: fail open as primary
+    }
+    if (listen(fd, 16) < 0) { close(fd); return true; }
+
+    g_singleInstanceSocketFd = fd;
+    GIOChannel* channel = g_io_channel_unix_new(fd);
+    g_io_add_watch(channel, static_cast<GIOCondition>(G_IO_IN | G_IO_HUP | G_IO_ERR),
+                   onSingleInstanceConnection, nullptr);
+    g_io_channel_unref(channel);
+    return true;
+}
+
+// Forward a deep-link URL from a secondary instance to the running primary.
+ELECTROBUN_EXPORT void electrobun_single_instance_send_url(const char* instanceKey, const char* url) {
+    if (!instanceKey || !url) return;
+    const int fd = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (fd < 0) return;
+
+    struct sockaddr_un addr;
+    const socklen_t addrlen = buildAbstractSockAddr(&addr, instanceKey);
+
+    // The primary may not be listening yet; retry the connect briefly.
+    int connected = -1;
+    for (int i = 0; i < 50; i++) {
+        connected = connect(fd, reinterpret_cast<struct sockaddr*>(&addr), addrlen);
+        if (connected == 0) break;
+        usleep(100000); // 100ms
+    }
+    if (connected == 0) {
+        std::string payload(url);
+        const size_t nl = payload.find('\n');
+        if (nl != std::string::npos) payload.resize(nl);
+        if (payload.size() > MAX_DEEP_LINK_URL_BYTES - 1) {
+            payload.resize(MAX_DEEP_LINK_URL_BYTES - 1);
+        }
+        payload.push_back('\n');
+        const ssize_t written = write(fd, payload.data(), payload.size());
+        (void)written;
+    }
+    close(fd);
 }
 
 ELECTROBUN_EXPORT void setAppReopenHandler(void (*callback)()) {

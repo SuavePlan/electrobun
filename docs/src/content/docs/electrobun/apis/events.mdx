@@ -94,12 +94,14 @@ Electrobun.events.on("open-url", (e) => {
 ```
 
 
-              <p><strong>Platform support:</strong></p>
+              <p><strong>Platform support (custom URL schemes / deep links):</strong></p>
               <ul>
                 <li>macOS: Fully supported. App must be in `/Applications` folder for URL scheme registration to work reliably.</li>
-                <li>Windows: Not yet supported</li>
-                <li>Linux: Not yet supported</li>
+                <li>Windows: Supported. Schemes are registered in the registry (HKCU) on first run; deep links reach a running app via single-instance forwarding.</li>
+                <li>Linux: Supported. Schemes are registered at install time via the app's `.desktop` file and `xdg-mime`; deep links reach a running app via single-instance forwarding.</li>
               </ul>
+
+              <p>File associations (`fileAssociations`) remain macOS-only. On Windows/Linux, deep links delivered while the app is already running require single-instance mode, which is enabled by default when `urlSchemes` is set (see the <code>singleInstance</code> config option).</p>
 
               <p><strong>Setup:</strong> To register deep links or file associations for your app, add `urlSchemes` and/or `fileAssociations` to your `electrobun.config.ts`. See the <a href="/electrobun/apis/cli/build-configuration">Build Configuration</a> docs for details.</p>
 

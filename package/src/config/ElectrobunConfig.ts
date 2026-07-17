@@ -67,9 +67,17 @@ export interface ElectrobunConfig {
 		 * This allows your app to be opened via URLs like myapp://some/path
 		 *
 		 * Platform support:
-		 * - macOS: Fully supported. App must be in /Applications folder for registration to work.
-		 * - Windows: Not yet supported
-		 * - Linux: Not yet supported
+		 * - macOS: Registered via CFBundleURLTypes in Info.plist. The app must be in the
+		 *   /Applications folder for the OS to register the handler.
+		 * - Windows: Registered in the registry (HKCU) on first run, pointing at the
+		 *   installed launcher. Registration self-heals if the app is moved.
+		 * - Linux: Registered at install time via a .desktop file
+		 *   (MimeType=x-scheme-handler/<scheme>) and `xdg-mime`.
+		 *
+		 * On Windows and Linux, deep links delivered while the app is already running rely
+		 * on single-instance forwarding — see `singleInstance` (enabled by default when
+		 * urlSchemes is set). In `dev` builds no install/registration step runs, so test
+		 * OS-routed links in a packaged build (you can still pass a URL as a launch argument).
 		 *
 		 * To handle incoming URLs, listen for the "open-url" event:
 		 * ```typescript
@@ -112,6 +120,23 @@ export interface ElectrobunConfig {
 			 */
 			icon?: string;
 		}>;
+
+		/**
+		 * Restrict the app to a single running instance.
+		 *
+		 * When enabled, launching the app while an instance is already running forwards
+		 * the launch to the existing instance (which is required for deep links to reach a
+		 * running app on Windows/Linux) and the second process exits instead of opening a
+		 * new window. A deep-link URL from the second launch is delivered to the running
+		 * instance through the "open-url" event.
+		 *
+		 * Default: enabled automatically when `urlSchemes` is set (so deep links work while
+		 * the app is open), disabled otherwise. Set explicitly to override.
+		 *
+		 * Platform support: Windows and Linux. macOS is always effectively single-instance
+		 * for a bundled app and routes deep links to the running instance via the OS.
+		 */
+		singleInstance?: boolean;
 	};
 
 	/**

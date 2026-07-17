@@ -79,6 +79,30 @@ static std::mutex g_dcompBridgeMapMutex;
 
 using namespace electrobun;
 
+// ============================================================================
+// Deep-link (custom URL scheme) delivery
+// ----------------------------------------------------------------------------
+// Mirrors the macOS implementation in macos/nativeWrapper.mm. The Bun worker
+// registers a handler via setURLOpenHandler(); URLs that arrive before it is
+// ready (cold launch) are buffered and flushed on registration. Cold-launch
+// argv URLs (electrobun_set_launch_url) and warm-launch URLs forwarded from a
+// second instance (WM_COPYDATA) both funnel through deliverUrlToHandlerOrBuffer().
+// ============================================================================
+static URLOpenHandler g_urlOpenHandler = nullptr;
+static std::vector<std::string> g_pendingUrlOpenPaths;
+static std::mutex g_urlOpenMutex;
+
+static void deliverUrlToHandlerOrBuffer(const char* url) {
+    if (!url) return;
+    std::lock_guard<std::mutex> lock(g_urlOpenMutex);
+    if (g_urlOpenHandler) {
+        g_urlOpenHandler(url);
+    } else {
+        // Handler not registered yet — buffer it; setURLOpenHandler flushes on registration.
+        g_pendingUrlOpenPaths.emplace_back(url);
+    }
+}
+
 // Simple ASAR reader implementation for Windows (no external dependency)
 #include <fstream>
 #include <map>
@@ -12555,11 +12579,174 @@ extern "C" ELECTROBUN_EXPORT void sessionClearStorageData(const char* partitionI
     }
 }
 
-// URL scheme handler - macOS only, stub for Windows
+// setURLOpenHandler - registers the deep-link handler and flushes any URLs that
+// arrived before registration (cold-launch buffer). Mirrors macos/nativeWrapper.mm:8252.
 extern "C" ELECTROBUN_EXPORT void setURLOpenHandler(void (*callback)(const char*)) {
-    (void)callback;
-    // Not supported on Windows - stub to prevent dlopen failure
-    // Windows URL protocol handling is done via registry
+    std::vector<std::string> pending;
+    {
+        std::lock_guard<std::mutex> lock(g_urlOpenMutex);
+        g_urlOpenHandler = callback;
+        pending = std::move(g_pendingUrlOpenPaths);
+    }
+    // Deliver outside the lock to avoid holding it during the FFI call into Bun.
+    for (const auto& url : pending) {
+        callback(url.c_str());
+    }
+}
+
+// electrobun_set_launch_url - called by the launcher for a cold-launch deep link,
+// where the URL arrives as an argv element rather than through an OS event. The URL
+// is buffered (or delivered) via the same path used by macOS's cold-launch buffer.
+extern "C" ELECTROBUN_EXPORT void electrobun_set_launch_url(const char* url) {
+    deliverUrlToHandlerOrBuffer(url);
+}
+
+// Register a single custom URL scheme under HKCU\Software\Classes\<scheme>. Writes the
+// "URL Protocol" marker and the shell\open\command that launches this app with the URL
+// as its first argument ("%1"). Returns false if a required key could not be created.
+static bool writeSchemeRegistryKeys(const std::wstring& scheme, const std::wstring& launcherPath) {
+    const std::wstring schemeKey = L"Software\\Classes\\" + scheme;
+
+    HKEY hScheme = nullptr;
+    LONG rc = RegCreateKeyExW(HKEY_CURRENT_USER, schemeKey.c_str(), 0, nullptr,
+                              REG_OPTION_NON_VOLATILE, KEY_WRITE, nullptr, &hScheme, nullptr);
+    if (rc != ERROR_SUCCESS) return false;
+
+    const std::wstring defaultVal = L"URL:" + scheme + L" Protocol";
+    RegSetValueExW(hScheme, nullptr, 0, REG_SZ,
+                   reinterpret_cast<const BYTE*>(defaultVal.c_str()),
+                   static_cast<DWORD>((defaultVal.size() + 1) * sizeof(wchar_t)));
+    // An empty "URL Protocol" value is what marks this key as a URL scheme handler.
+    static const wchar_t kEmpty[] = L"";
+    RegSetValueExW(hScheme, L"URL Protocol", 0, REG_SZ,
+                   reinterpret_cast<const BYTE*>(kEmpty), sizeof(wchar_t));
+    RegCloseKey(hScheme);
+
+    const std::wstring commandKey = schemeKey + L"\\shell\\open\\command";
+    HKEY hCommand = nullptr;
+    rc = RegCreateKeyExW(HKEY_CURRENT_USER, commandKey.c_str(), 0, nullptr,
+                         REG_OPTION_NON_VOLATILE, KEY_WRITE, nullptr, &hCommand, nullptr);
+    if (rc != ERROR_SUCCESS) return false;
+
+    const std::wstring command = L"\"" + launcherPath + L"\" \"%1\"";
+    RegSetValueExW(hCommand, nullptr, 0, REG_SZ,
+                   reinterpret_cast<const BYTE*>(command.c_str()),
+                   static_cast<DWORD>((command.size() + 1) * sizeof(wchar_t)));
+    RegCloseKey(hCommand);
+    return true;
+}
+
+// electrobun_register_url_schemes - first-run deep-link registration on Windows.
+// The launcher calls this on startup (HKCU, no admin needed) with a comma-separated list
+// of schemes and the running launcher's path, so registration self-heals if the app moves.
+// This is the Windows analogue of macOS's build-time CFBundleURLTypes and Linux's
+// install-time xdg-mime registration.
+extern "C" ELECTROBUN_EXPORT void electrobun_register_url_schemes(const char* schemesCsv, const char* launcherPath) {
+    if (!schemesCsv || !launcherPath) return;
+    const std::wstring wLauncher = StringToWString(std::string(launcherPath));
+
+    const std::string csv(schemesCsv);
+    size_t start = 0;
+    while (start <= csv.size()) {
+        const size_t comma = csv.find(',', start);
+        const std::string token = (comma == std::string::npos)
+            ? csv.substr(start)
+            : csv.substr(start, comma - start);
+
+        const size_t b = token.find_first_not_of(" \t");
+        const size_t e = token.find_last_not_of(" \t");
+        if (b != std::string::npos) {
+            const std::string scheme = token.substr(b, e - b + 1);
+            if (!scheme.empty()) {
+                writeSchemeRegistryKeys(StringToWString(scheme), wLauncher);
+            }
+        }
+
+        if (comma == std::string::npos) break;
+        start = comma + 1;
+    }
+}
+
+// ============================================================================
+// Single-instance / warm-launch deep-link forwarding (Windows)
+// ----------------------------------------------------------------------------
+// The primary instance owns a named mutex and a hidden message-only window. A
+// secondary launch detects the mutex, forwards its deep-link URL to the primary via
+// WM_COPYDATA, and exits. The primary's WndProc routes the URL through the shared
+// deliverUrlToHandlerOrBuffer() path (delivered to the app as an "open-url" event).
+// ============================================================================
+static constexpr DWORD MAX_DEEP_LINK_URL_BYTES = 8 * 1024;
+static HANDLE g_singleInstanceMutex = nullptr;
+static HWND g_singleInstanceReceiver = nullptr;
+static const wchar_t* kReceiverClassName = L"ElectrobunMessageReceiver";
+
+static LRESULT CALLBACK ElectrobunReceiverWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
+    if (msg == WM_COPYDATA) {
+        const COPYDATASTRUCT* cds = reinterpret_cast<const COPYDATASTRUCT*>(lParam);
+        if (cds && cds->lpData && cds->cbData > 0 && cds->cbData <= MAX_DEEP_LINK_URL_BYTES) {
+            std::string url(reinterpret_cast<const char*>(cds->lpData), cds->cbData);
+            const size_t nul = url.find('\0');
+            if (nul != std::string::npos) url.resize(nul);
+            deliverUrlToHandlerOrBuffer(url.c_str());
+        }
+        return TRUE;
+    }
+    return DefWindowProcW(hwnd, msg, wParam, lParam);
+}
+
+// Returns true if this is the primary instance (and sets up the receiver window), false
+// if another instance already holds the lock. Fails open (returns true) on any error.
+extern "C" ELECTROBUN_EXPORT bool electrobun_single_instance_acquire(const char* instanceKey) {
+    if (!instanceKey) return true;
+    const std::wstring wKey = StringToWString(std::string(instanceKey));
+    const std::wstring mutexName = L"Local\\" + wKey;
+
+    g_singleInstanceMutex = CreateMutexW(nullptr, TRUE, mutexName.c_str());
+    const DWORD err = GetLastError();
+    if (g_singleInstanceMutex == nullptr) {
+        return true; // could not create the mutex; fail open as primary
+    }
+    if (err == ERROR_ALREADY_EXISTS) {
+        return false; // another instance owns the lock -> secondary
+    }
+
+    // Primary: create a hidden message-only window to receive forwarded URLs. Its title is
+    // the instance key so a secondary can locate exactly this app's receiver.
+    WNDCLASSEXW wc = {};
+    wc.cbSize = sizeof(wc);
+    wc.lpfnWndProc = ElectrobunReceiverWndProc;
+    wc.hInstance = GetModuleHandleW(nullptr);
+    wc.lpszClassName = kReceiverClassName;
+    RegisterClassExW(&wc); // ignore "class already registered"
+    g_singleInstanceReceiver = CreateWindowExW(
+        0, kReceiverClassName, wKey.c_str(), 0, 0, 0, 0, 0,
+        HWND_MESSAGE, nullptr, GetModuleHandleW(nullptr), nullptr);
+    return true;
+}
+
+// Forward a deep-link URL from a secondary instance to the running primary via WM_COPYDATA.
+extern "C" ELECTROBUN_EXPORT void electrobun_single_instance_send_url(const char* instanceKey, const char* url) {
+    if (!instanceKey || !url) return;
+    const std::wstring wKey = StringToWString(std::string(instanceKey));
+
+    HWND hwnd = FindWindowExW(HWND_MESSAGE, nullptr, kReceiverClassName, wKey.c_str());
+    // The primary may not have created its window yet; retry briefly.
+    for (int i = 0; i < 50 && hwnd == nullptr; i++) {
+        Sleep(100);
+        hwnd = FindWindowExW(HWND_MESSAGE, nullptr, kReceiverClassName, wKey.c_str());
+    }
+    if (hwnd == nullptr) return;
+
+    DWORD len = 0;
+    while (len < MAX_DEEP_LINK_URL_BYTES && url[len] != '\0') len++;
+
+    COPYDATASTRUCT cds = {};
+    cds.dwData = 0;
+    cds.cbData = len;
+    cds.lpData = const_cast<char*>(url);
+    DWORD_PTR result = 0;
+    SendMessageTimeoutW(hwnd, WM_COPYDATA, 0, reinterpret_cast<LPARAM>(&cds),
+                        SMTO_ABORTIFHUNG, 5000, &result);
 }
 
 // App reopen handler - macOS only, stub for Windows

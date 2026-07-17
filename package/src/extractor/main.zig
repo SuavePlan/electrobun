@@ -908,6 +908,32 @@ fn escapeDesktopString(allocator: std.mem.Allocator, str: []const u8) ![]u8 {
     return escaped;
 }
 
+// Register the app as the default handler for each custom URL scheme declared in the
+// desktop file's `MimeType=x-scheme-handler/<scheme>;...` line (deep linking on Linux).
+// Best-effort: individual failures are logged and skipped, never fatal to installation.
+fn registerSchemeHandlers(allocator: std.mem.Allocator, desktop_content: []const u8, desktop_filename: []const u8) void {
+    var lines = std.mem.tokenize(u8, desktop_content, "\n");
+    while (lines.next()) |line| {
+        if (!std.mem.startsWith(u8, line, "MimeType=")) continue;
+        const value = line["MimeType=".len..];
+        var mimes = std.mem.tokenize(u8, value, ";");
+        while (mimes.next()) |mime| {
+            const trimmed = std.mem.trim(u8, mime, " \t\r");
+            if (!std.mem.startsWith(u8, trimmed, "x-scheme-handler/")) continue;
+            const xdg_argv = [_][]const u8{ "xdg-mime", "default", desktop_filename, trimmed };
+            var xdg_child = std.process.Child.init(&xdg_argv, allocator);
+            xdg_child.stdin_behavior = .Ignore;
+            xdg_child.stdout_behavior = .Ignore;
+            xdg_child.stderr_behavior = .Inherit;
+            _ = xdg_child.spawnAndWait() catch |err| {
+                std.debug.print("Note: Could not register URL scheme handler {s}: {}\n", .{ trimmed, err });
+                continue;
+            };
+            std.debug.print("Registered URL scheme handler: {s} -> {s}\n", .{ trimmed, desktop_filename });
+        }
+    }
+}
+
 fn createDesktopShortcut(allocator: std.mem.Allocator, app_dir: []const u8, metadata: AppMetadata) !void {
     // Get home directory for desktop path
     const home = std.process.getEnvVarOwned(allocator, "HOME") catch {
@@ -1009,10 +1035,13 @@ fn createDesktopShortcut(allocator: std.mem.Allocator, app_dir: []const u8, meta
 
             while (lines.next()) |line| {
                 if (std.mem.startsWith(u8, line, "Exec=")) {
-                    // Replace with new Exec line - point to launcher binary
+                    // Replace with new Exec line - point to launcher binary.
+                    // The `%u` field code MUST be preserved so the desktop entry passes a
+                    // deep-link URL (x-scheme-handler) through to the launcher as an argv
+                    // element. Without it, custom URL scheme launches deliver no URL.
                     try result.appendSlice("Exec=\"");
                     try result.appendSlice(launcher_path);
-                    try result.appendSlice("\"\n");
+                    try result.appendSlice("\" %u\n");
                 } else if (std.mem.startsWith(u8, line, "Icon=") and icon_path_allocated) {
                     // Replace with new Icon line
                     try result.appendSlice("Icon=");
@@ -1104,6 +1133,11 @@ fn createDesktopShortcut(allocator: std.mem.Allocator, app_dir: []const u8, meta
                 _ = update_db_child.spawnAndWait() catch |err| {
                     std.debug.print("Note: Could not update desktop database: {}\n", .{err});
                 };
+
+                // Register this app as the default handler for its custom URL schemes
+                // (deep linking). The schemes are read from the desktop file's
+                // MimeType=x-scheme-handler/<scheme> entries, written at build time.
+                registerSchemeHandlers(allocator, desktop_content, desktop_filename);
 
                 applications_entry_created = true;
                 std.debug.print("Copied desktop shortcut to applications dir: {s}\n", .{applications_file_path});

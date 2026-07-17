@@ -199,9 +199,13 @@ export default {
               <p><strong>Platform support:</strong></p>
               <ul>
                 <li>macOS: Fully supported. App must be in `/Applications` folder for URL scheme registration to work reliably.</li>
-                <li>Windows: Not yet supported</li>
-                <li>Linux: Not yet supported</li>
+                <li>Windows: Supported. Schemes are registered in the registry (HKCU) on first run, pointing at the installed launcher (self-healing if the app moves).</li>
+                <li>Linux: Supported. Schemes are registered at install time via the app's `.desktop` file (`MimeType=x-scheme-handler/<scheme>`) and `xdg-mime`.</li>
               </ul>
+
+              <Aside type="note">
+                <p>On Windows and Linux, deep links clicked while the app is already running are delivered to the running instance through single-instance forwarding. This is enabled by default when `urlSchemes` is set, and can be controlled with the `app.singleInstance` config option. In `dev` builds no install/registration step runs, so validate OS-routed links in a packaged build — you can still test delivery by passing a `myapp://...` URL as a launch argument to the built launcher.</p>
+              </Aside>
 
 ### Configuration
 
