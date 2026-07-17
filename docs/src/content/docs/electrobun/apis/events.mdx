@@ -101,7 +101,7 @@ Electrobun.events.on("open-url", (e) => {
                 <li>Linux: Supported. Schemes are registered at install time via the app's `.desktop` file and `xdg-mime`; deep links reach a running app via single-instance forwarding.</li>
               </ul>
 
-              <p>File associations (`fileAssociations`) remain macOS-only. On Windows/Linux, deep links delivered while the app is already running require single-instance mode, which is enabled by default when `urlSchemes` is set (see the <code>singleInstance</code> config option).</p>
+              <p>File associations (`fileAssociations`) are supported on all three platforms too; opened files arrive as `file://` URLs through this same event. On Windows/Linux, deep links and file opens delivered while the app is already running require single-instance mode, which is enabled by default when `urlSchemes` is set (see the <code>singleInstance</code> config option).</p>
 
               <p><strong>Setup:</strong> To register deep links or file associations for your app, add `urlSchemes` and/or `fileAssociations` to your `electrobun.config.ts`. See the <a href="/electrobun/apis/cli/build-configuration">Build Configuration</a> docs for details.</p>
 

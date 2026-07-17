@@ -94,8 +94,10 @@ export interface ElectrobunConfig {
 		 * (e.g., double-click in Finder, "Open With" menu, drag-to-dock).
 		 *
 		 * Platform support:
-		 * - macOS: Fully supported. Generates CFBundleDocumentTypes in Info.plist.
-		 * - Windows/Linux: Not yet supported.
+		 * - macOS: Generates CFBundleDocumentTypes in Info.plist.
+		 * - Windows: Per-extension ProgIDs are registered in the registry (HKCU) on first run.
+		 * - Linux: A shared-mime-info XML is installed and registered with xdg-mime at install
+		 *   time. The `icon` field (macOS .icns) is ignored on Windows/Linux.
 		 *
 		 * Files arrive as file:// URLs via the existing "open-url" event:
 		 * ```typescript

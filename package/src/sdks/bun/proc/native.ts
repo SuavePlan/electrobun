@@ -2450,9 +2450,9 @@ if (native) {
 		},
 		{ args: [], returns: "void", threadsafe: true },
 	);
-	if (process.platform === "darwin") {
-		native_.symbols.setAppReopenHandler(appReopenCallback);
-	}
+	// Reopen is delivered on all platforms: macOS via applicationShouldHandleReopen,
+	// Windows/Linux via single-instance forwarding (a second launch with no deep-link URL).
+	native_.symbols.setAppReopenHandler(appReopenCallback);
 
 	const quitRequestedCallback = new JSCallback(
 		() => {

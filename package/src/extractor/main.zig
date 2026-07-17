@@ -908,10 +908,11 @@ fn escapeDesktopString(allocator: std.mem.Allocator, str: []const u8) ![]u8 {
     return escaped;
 }
 
-// Register the app as the default handler for each custom URL scheme declared in the
-// desktop file's `MimeType=x-scheme-handler/<scheme>;...` line (deep linking on Linux).
-// Best-effort: individual failures are logged and skipped, never fatal to installation.
-fn registerSchemeHandlers(allocator: std.mem.Allocator, desktop_content: []const u8, desktop_filename: []const u8) void {
+// Register the app as the default handler for every MIME type in the desktop file's
+// `MimeType=` line — both `x-scheme-handler/<scheme>` entries (deep links) and custom
+// `application/x-...` types (file associations). Best-effort: failures are logged and
+// skipped, never fatal to installation.
+fn registerMimeDefaults(allocator: std.mem.Allocator, desktop_content: []const u8, desktop_filename: []const u8) void {
     var lines = std.mem.tokenize(u8, desktop_content, "\n");
     while (lines.next()) |line| {
         if (!std.mem.startsWith(u8, line, "MimeType=")) continue;
@@ -919,19 +920,56 @@ fn registerSchemeHandlers(allocator: std.mem.Allocator, desktop_content: []const
         var mimes = std.mem.tokenize(u8, value, ";");
         while (mimes.next()) |mime| {
             const trimmed = std.mem.trim(u8, mime, " \t\r");
-            if (!std.mem.startsWith(u8, trimmed, "x-scheme-handler/")) continue;
+            if (trimmed.len == 0) continue;
             const xdg_argv = [_][]const u8{ "xdg-mime", "default", desktop_filename, trimmed };
             var xdg_child = std.process.Child.init(&xdg_argv, allocator);
             xdg_child.stdin_behavior = .Ignore;
             xdg_child.stdout_behavior = .Ignore;
             xdg_child.stderr_behavior = .Inherit;
             _ = xdg_child.spawnAndWait() catch |err| {
-                std.debug.print("Note: Could not register URL scheme handler {s}: {}\n", .{ trimmed, err });
+                std.debug.print("Note: Could not register default handler {s}: {}\n", .{ trimmed, err });
                 continue;
             };
-            std.debug.print("Registered URL scheme handler: {s} -> {s}\n", .{ trimmed, desktop_filename });
+            std.debug.print("Registered default handler: {s} -> {s}\n", .{ trimmed, desktop_filename });
         }
     }
+}
+
+// Install the app's shared-mime-info XML (custom file-association MIME types) into
+// ~/.local/share/mime/packages and rebuild the MIME database so xdg-mime recognizes the
+// new types. No-op when the app declares no file associations (no mimetypes.xml present).
+fn installMimeInfoXml(allocator: std.mem.Allocator, app_dir: []const u8, identifier: []const u8) void {
+    const src = std.fs.path.join(allocator, &.{ app_dir, "mimetypes.xml" }) catch return;
+    defer allocator.free(src);
+    std.fs.cwd().access(src, .{}) catch return; // no file associations -> nothing to do
+
+    const xdg_data = getAppDataDir(allocator) catch return;
+    defer allocator.free(xdg_data);
+    const mime_dir = std.fs.path.join(allocator, &.{ xdg_data, "mime" }) catch return;
+    defer allocator.free(mime_dir);
+    const packages_dir = std.fs.path.join(allocator, &.{ mime_dir, "packages" }) catch return;
+    defer allocator.free(packages_dir);
+    std.fs.cwd().makePath(packages_dir) catch {};
+
+    const dest_name = std.fmt.allocPrint(allocator, "{s}.xml", .{identifier}) catch return;
+    defer allocator.free(dest_name);
+    const dest = std.fs.path.join(allocator, &.{ packages_dir, dest_name }) catch return;
+    defer allocator.free(dest);
+
+    std.fs.cwd().copyFile(src, std.fs.cwd(), dest, .{}) catch |err| {
+        std.debug.print("Note: Could not install MIME info XML: {}\n", .{err});
+        return;
+    };
+
+    const argv = [_][]const u8{ "update-mime-database", mime_dir };
+    var child = std.process.Child.init(&argv, allocator);
+    child.stdin_behavior = .Ignore;
+    child.stdout_behavior = .Ignore;
+    child.stderr_behavior = .Inherit;
+    _ = child.spawnAndWait() catch |err| {
+        std.debug.print("Note: Could not update MIME database: {}\n", .{err});
+    };
+    std.debug.print("Installed MIME info: {s}\n", .{dest});
 }
 
 fn createDesktopShortcut(allocator: std.mem.Allocator, app_dir: []const u8, metadata: AppMetadata) !void {
@@ -1134,10 +1172,13 @@ fn createDesktopShortcut(allocator: std.mem.Allocator, app_dir: []const u8, meta
                     std.debug.print("Note: Could not update desktop database: {}\n", .{err});
                 };
 
-                // Register this app as the default handler for its custom URL schemes
-                // (deep linking). The schemes are read from the desktop file's
-                // MimeType=x-scheme-handler/<scheme> entries, written at build time.
-                registerSchemeHandlers(allocator, desktop_content, desktop_filename);
+                // Install any custom file-association MIME types before registering defaults,
+                // so xdg-mime recognizes them.
+                installMimeInfoXml(allocator, app_dir, metadata.identifier);
+
+                // Register this app as the default handler for its URL schemes and file
+                // associations (all MimeType entries in the desktop file, written at build time).
+                registerMimeDefaults(allocator, desktop_content, desktop_filename);
 
                 applications_entry_created = true;
                 std.debug.print("Copied desktop shortcut to applications dir: {s}\n", .{applications_file_path});

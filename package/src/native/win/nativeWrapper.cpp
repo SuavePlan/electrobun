@@ -92,6 +92,11 @@ static URLOpenHandler g_urlOpenHandler = nullptr;
 static std::vector<std::string> g_pendingUrlOpenPaths;
 static std::mutex g_urlOpenMutex;
 
+// App-reopen (the app is launched again while already running). On Windows this is driven
+// by single-instance forwarding: a second launch with no deep-link URL signals "reopen".
+static AppReopenHandler g_appReopenHandler = nullptr;
+static bool g_pendingReopen = false; // set if a reopen arrives before the handler registers
+
 static void deliverUrlToHandlerOrBuffer(const char* url) {
     if (!url) return;
     std::lock_guard<std::mutex> lock(g_urlOpenMutex);
@@ -100,6 +105,36 @@ static void deliverUrlToHandlerOrBuffer(const char* url) {
     } else {
         // Handler not registered yet — buffer it; setURLOpenHandler flushes on registration.
         g_pendingUrlOpenPaths.emplace_back(url);
+    }
+}
+
+static void deliverReopenOrBuffer() {
+    std::lock_guard<std::mutex> lock(g_urlOpenMutex);
+    if (g_appReopenHandler) {
+        g_appReopenHandler();
+    } else {
+        g_pendingReopen = true; // flushed when setAppReopenHandler registers
+    }
+}
+
+// Best-effort: bring one of this process's top-level windows to the foreground. Used on a
+// warm launch (deep link / reopen forwarded from a second instance) so the app surfaces.
+static void bringAppToForeground() {
+    struct EnumCtx { DWORD pid; HWND found; } ctx{ GetCurrentProcessId(), nullptr };
+    EnumWindows([](HWND hwnd, LPARAM lparam) -> BOOL {
+        auto* c = reinterpret_cast<EnumCtx*>(lparam);
+        DWORD wpid = 0;
+        GetWindowThreadProcessId(hwnd, &wpid);
+        if (wpid == c->pid && IsWindowVisible(hwnd) && GetWindow(hwnd, GW_OWNER) == nullptr) {
+            c->found = hwnd;
+            return FALSE; // stop at the first visible top-level window
+        }
+        return TRUE;
+    }, reinterpret_cast<LPARAM>(&ctx));
+    if (ctx.found) {
+        if (IsIconic(ctx.found)) ShowWindow(ctx.found, SW_RESTORE);
+        SetForegroundWindow(ctx.found);
+        BringWindowToTop(ctx.found);
     }
 }
 
@@ -12667,6 +12702,94 @@ extern "C" ELECTROBUN_EXPORT void electrobun_register_url_schemes(const char* sc
     }
 }
 
+// Register a single file extension under HKCU: point `.ext` at a ProgID, and give the
+// ProgID a shell\open\command that launches this app with the file path as its first
+// argument ("%1"). Returns false if a required key could not be created.
+static bool writeFileAssocRegistryKeys(const std::wstring& ext, const std::wstring& progId,
+                                       const std::wstring& launcherPath) {
+    // HKCU\Software\Classes\.<ext> (default) = <progId>
+    {
+        HKEY hExt = nullptr;
+        const std::wstring extKey = L"Software\\Classes\\." + ext;
+        if (RegCreateKeyExW(HKEY_CURRENT_USER, extKey.c_str(), 0, nullptr,
+                            REG_OPTION_NON_VOLATILE, KEY_WRITE, nullptr, &hExt, nullptr) != ERROR_SUCCESS)
+            return false;
+        RegSetValueExW(hExt, nullptr, 0, REG_SZ,
+                       reinterpret_cast<const BYTE*>(progId.c_str()),
+                       static_cast<DWORD>((progId.size() + 1) * sizeof(wchar_t)));
+        RegCloseKey(hExt);
+    }
+    // HKCU\Software\Classes\<progId> (default) = "<ext> file"
+    {
+        HKEY hProg = nullptr;
+        const std::wstring progKey = L"Software\\Classes\\" + progId;
+        if (RegCreateKeyExW(HKEY_CURRENT_USER, progKey.c_str(), 0, nullptr,
+                            REG_OPTION_NON_VOLATILE, KEY_WRITE, nullptr, &hProg, nullptr) != ERROR_SUCCESS)
+            return false;
+        const std::wstring friendly = ext + L" file";
+        RegSetValueExW(hProg, nullptr, 0, REG_SZ,
+                       reinterpret_cast<const BYTE*>(friendly.c_str()),
+                       static_cast<DWORD>((friendly.size() + 1) * sizeof(wchar_t)));
+        RegCloseKey(hProg);
+    }
+    // HKCU\Software\Classes\<progId>\shell\open\command (default) = "<launcher>" "%1"
+    {
+        HKEY hCmd = nullptr;
+        const std::wstring cmdKey = L"Software\\Classes\\" + progId + L"\\shell\\open\\command";
+        if (RegCreateKeyExW(HKEY_CURRENT_USER, cmdKey.c_str(), 0, nullptr,
+                            REG_OPTION_NON_VOLATILE, KEY_WRITE, nullptr, &hCmd, nullptr) != ERROR_SUCCESS)
+            return false;
+        const std::wstring command = L"\"" + launcherPath + L"\" \"%1\"";
+        RegSetValueExW(hCmd, nullptr, 0, REG_SZ,
+                       reinterpret_cast<const BYTE*>(command.c_str()),
+                       static_cast<DWORD>((command.size() + 1) * sizeof(wchar_t)));
+        RegCloseKey(hCmd);
+    }
+    return true;
+}
+
+// electrobun_register_file_associations - first-run file-association registration on Windows.
+// The launcher passes the app identifier, a comma-separated list of extensions, and the
+// running launcher path; each extension gets a ProgID (<identifier>.<ext>) mapped to a
+// shell\open\command. HKCU only (no admin), self-healing on the launcher path. Windows
+// analogue of macOS's CFBundleDocumentTypes and Linux's shared-mime-info + xdg-mime.
+extern "C" ELECTROBUN_EXPORT void electrobun_register_file_associations(const char* identifier,
+                                                                        const char* extsCsv,
+                                                                        const char* launcherPath) {
+    if (!identifier || !extsCsv || !launcherPath) return;
+    const std::wstring wIdentifier = StringToWString(std::string(identifier));
+    const std::wstring wLauncher = StringToWString(std::string(launcherPath));
+
+    bool any = false;
+    const std::string csv(extsCsv);
+    size_t start = 0;
+    while (start <= csv.size()) {
+        const size_t comma = csv.find(',', start);
+        const std::string token = (comma == std::string::npos)
+            ? csv.substr(start)
+            : csv.substr(start, comma - start);
+
+        const size_t b = token.find_first_not_of(" \t.");
+        const size_t e = token.find_last_not_of(" \t");
+        if (b != std::string::npos) {
+            const std::string ext = token.substr(b, e - b + 1);
+            if (!ext.empty()) {
+                const std::wstring wExt = StringToWString(ext);
+                const std::wstring progId = wIdentifier + L"." + wExt;
+                if (writeFileAssocRegistryKeys(wExt, progId, wLauncher)) any = true;
+            }
+        }
+
+        if (comma == std::string::npos) break;
+        start = comma + 1;
+    }
+
+    if (any) {
+        // Tell the shell that file associations changed so Explorer picks them up.
+        SHChangeNotify(SHCNE_ASSOCCHANGED, SHCNF_IDLIST, nullptr, nullptr);
+    }
+}
+
 // ============================================================================
 // Single-instance / warm-launch deep-link forwarding (Windows)
 // ----------------------------------------------------------------------------
@@ -12680,14 +12803,24 @@ static HANDLE g_singleInstanceMutex = nullptr;
 static HWND g_singleInstanceReceiver = nullptr;
 static const wchar_t* kReceiverClassName = L"ElectrobunMessageReceiver";
 
+// WM_COPYDATA discriminator (dwData): a forwarded deep-link URL vs. a bare reopen signal.
+static constexpr ULONG_PTR ELECTROBUN_MSG_URL = 0;
+static constexpr ULONG_PTR ELECTROBUN_MSG_REOPEN = 1;
+
 static LRESULT CALLBACK ElectrobunReceiverWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     if (msg == WM_COPYDATA) {
         const COPYDATASTRUCT* cds = reinterpret_cast<const COPYDATASTRUCT*>(lParam);
-        if (cds && cds->lpData && cds->cbData > 0 && cds->cbData <= MAX_DEEP_LINK_URL_BYTES) {
-            std::string url(reinterpret_cast<const char*>(cds->lpData), cds->cbData);
-            const size_t nul = url.find('\0');
-            if (nul != std::string::npos) url.resize(nul);
-            deliverUrlToHandlerOrBuffer(url.c_str());
+        if (cds) {
+            if (cds->dwData == ELECTROBUN_MSG_REOPEN) {
+                deliverReopenOrBuffer();
+                bringAppToForeground();
+            } else if (cds->lpData && cds->cbData > 0 && cds->cbData <= MAX_DEEP_LINK_URL_BYTES) {
+                std::string url(reinterpret_cast<const char*>(cds->lpData), cds->cbData);
+                const size_t nul = url.find('\0');
+                if (nul != std::string::npos) url.resize(nul);
+                deliverUrlToHandlerOrBuffer(url.c_str());
+                bringAppToForeground();
+            }
         }
         return TRUE;
     }
@@ -12737,11 +12870,16 @@ extern "C" ELECTROBUN_EXPORT void electrobun_single_instance_send_url(const char
     }
     if (hwnd == nullptr) return;
 
+    // Let the primary process take the foreground when it surfaces its window.
+    DWORD targetPid = 0;
+    GetWindowThreadProcessId(hwnd, &targetPid);
+    if (targetPid) AllowSetForegroundWindow(targetPid);
+
     DWORD len = 0;
     while (len < MAX_DEEP_LINK_URL_BYTES && url[len] != '\0') len++;
 
     COPYDATASTRUCT cds = {};
-    cds.dwData = 0;
+    cds.dwData = ELECTROBUN_MSG_URL;
     cds.cbData = len;
     cds.lpData = const_cast<char*>(url);
     DWORD_PTR result = 0;
@@ -12749,10 +12887,43 @@ extern "C" ELECTROBUN_EXPORT void electrobun_single_instance_send_url(const char
                         SMTO_ABORTIFHUNG, 5000, &result);
 }
 
-// App reopen handler - macOS only, stub for Windows
+// Signal the running primary that the app was launched again with no deep-link URL (reopen).
+// Delivered as a WM_COPYDATA with the REOPEN discriminator; the primary raises its window.
+extern "C" ELECTROBUN_EXPORT void electrobun_single_instance_send_reopen(const char* instanceKey) {
+    if (!instanceKey) return;
+    const std::wstring wKey = StringToWString(std::string(instanceKey));
+
+    HWND hwnd = FindWindowExW(HWND_MESSAGE, nullptr, kReceiverClassName, wKey.c_str());
+    for (int i = 0; i < 50 && hwnd == nullptr; i++) {
+        Sleep(100);
+        hwnd = FindWindowExW(HWND_MESSAGE, nullptr, kReceiverClassName, wKey.c_str());
+    }
+    if (hwnd == nullptr) return;
+
+    DWORD targetPid = 0;
+    GetWindowThreadProcessId(hwnd, &targetPid);
+    if (targetPid) AllowSetForegroundWindow(targetPid);
+
+    COPYDATASTRUCT cds = {};
+    cds.dwData = ELECTROBUN_MSG_REOPEN;
+    cds.cbData = 0;
+    cds.lpData = nullptr;
+    DWORD_PTR result = 0;
+    SendMessageTimeoutW(hwnd, WM_COPYDATA, 0, reinterpret_cast<LPARAM>(&cds),
+                        SMTO_ABORTIFHUNG, 5000, &result);
+}
+
+// setAppReopenHandler - registers the reopen handler and fires it immediately if a reopen
+// signal arrived before registration. Reopen is driven by single-instance forwarding.
 extern "C" ELECTROBUN_EXPORT void setAppReopenHandler(void (*callback)()) {
-    (void)callback;
-    // Not supported on Windows - stub to prevent dlopen failure
+    bool pending = false;
+    {
+        std::lock_guard<std::mutex> lock(g_urlOpenMutex);
+        g_appReopenHandler = callback;
+        pending = g_pendingReopen;
+        g_pendingReopen = false;
+    }
+    if (pending && callback) callback();
 }
 
 // Dock icon visibility - macOS only, stubs for Windows

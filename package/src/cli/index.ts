@@ -2326,6 +2326,48 @@ ${utiDecls}
     </array>`;
 }
 
+// Derives a stable, valid MIME subtype for a custom file extension, mirroring the macOS UTI
+// convention (<identifier>.<ext>). Used for Linux file associations.
+function fileAssocMimeType(appIdentifier: string, ext: string): string {
+	const sub = `${appIdentifier}.${ext}`
+		.toLowerCase()
+		.replace(/[^a-z0-9.+_-]/g, "-");
+	return `application/x-${sub}`;
+}
+
+// Generates a shared-mime-info XML declaring one custom MIME type per associated extension.
+// The self-extractor installs it into ~/.local/share/mime/packages and registers the app as
+// the default handler via xdg-mime. Returns "" when there are no file associations.
+function generateMimeInfoXml(
+	fileAssociations: FileAssociation[] | undefined,
+	appIdentifier: string,
+): string {
+	if (!fileAssociations || fileAssociations.length === 0) return "";
+	const entries: string[] = [];
+	for (const assoc of fileAssociations) {
+		if (!assoc.ext || assoc.ext.length === 0) continue;
+		for (const rawExt of assoc.ext) {
+			const ext = rawExt.replace(/^\./, "").toLowerCase();
+			if (!ext) continue;
+			const mime = fileAssocMimeType(appIdentifier, ext);
+			const comment = escapeXml(assoc.name || `${ext} file`);
+			entries.push(
+				`  <mime-type type="${escapeXml(mime)}">\n` +
+					`    <comment>${comment}</comment>\n` +
+					`    <glob pattern="*.${escapeXml(ext)}"/>\n` +
+					`  </mime-type>`,
+			);
+		}
+	}
+	if (entries.length === 0) return "";
+	return (
+		`<?xml version="1.0" encoding="UTF-8"?>\n` +
+		`<mime-info xmlns="http://www.freedesktop.org/standards/shared-mime-info">\n` +
+		entries.join("\n") +
+		`\n</mime-info>\n`
+	);
+}
+
 // Execute command handling
 (async () => {
 	if (commandArg === "init") {
@@ -2743,12 +2785,21 @@ ${utiDecls}
 				// just when an icon is set) because it also registers custom URL schemes for
 				// deep linking via MimeType=x-scheme-handler/<scheme> and passes the launched
 				// URL to the app through the `%u` field code in Exec.
-				const schemeMimeTypes = (config.app.urlSchemes ?? [])
-					.map((scheme: string) => `x-scheme-handler/${scheme}`)
-					.join(";");
-				const mimeTypeLine = schemeMimeTypes
-					? `MimeType=${schemeMimeTypes};\n`
-					: "";
+				const schemeMimeTypes = (config.app.urlSchemes ?? []).map(
+					(scheme: string) => `x-scheme-handler/${scheme}`,
+				);
+				const fileMimeTypes = (config.app.fileAssociations ?? []).flatMap(
+					(assoc) =>
+						(assoc.ext ?? [])
+							.map((e) => e.replace(/^\./, "").toLowerCase())
+							.filter((e) => e.length > 0)
+							.map((ext) => fileAssocMimeType(config.app.identifier, ext)),
+				);
+				const allMimeTypes = [...schemeMimeTypes, ...fileMimeTypes];
+				const mimeTypeLine =
+					allMimeTypes.length > 0
+						? `MimeType=${allMimeTypes.join(";")};\n`
+						: "";
 				const desktopContent = `[Desktop Entry]
 Version=1.0
 Type=Application
@@ -2767,6 +2818,18 @@ ${mimeTypeLine}`;
 				);
 				writeFileSync(desktopFilePath, desktopContent);
 				console.log(`Created Linux desktop file: ${desktopFilePath}`);
+
+				// Write a shared-mime-info XML for custom file associations. The self-extractor
+				// installs it into ~/.local/share/mime and registers the app via xdg-mime.
+				const mimeInfoXml = generateMimeInfoXml(
+					config.app.fileAssociations,
+					config.app.identifier,
+				);
+				if (mimeInfoXml) {
+					const mimeXmlPath = join(appBundleFolderPath, "mimetypes.xml");
+					writeFileSync(mimeXmlPath, mimeInfoXml);
+					console.log(`Created Linux MIME info: ${mimeXmlPath}`);
+				}
 			} else if (targetOS === "win" && config.build.win?.icon) {
 				const iconPath = join(projectRoot, config.build.win.icon);
 				if (existsSync(iconPath)) {
@@ -4184,6 +4247,13 @@ usageDescriptions : ""}${urlTypes ? "\n" + urlTypes : ""}${documentTypes ?
 			// a deep-link argv element on Windows/Linux (cold launch) and to decide whether
 			// to enforce single-instance forwarding.
 			urlSchemes: config.app.urlSchemes ?? [],
+			// Flattened list of associated file extensions (no leading dot, lowercased). The
+			// launcher matches a file-path argv element against these and delivers it as a
+			// file:// URL through the same open-url path.
+			fileExtensions: (config.app.fileAssociations ?? [])
+				.flatMap((a) => a.ext ?? [])
+				.map((e) => e.replace(/^\./, "").toLowerCase())
+				.filter((e) => e.length > 0),
 			// Whether the launcher enforces single-instance behavior (Windows/Linux). Defaults
 			// to enabled when urlSchemes are set so deep links reach an already-running app.
 			singleInstance:

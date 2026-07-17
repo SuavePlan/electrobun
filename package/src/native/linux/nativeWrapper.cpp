@@ -82,6 +82,11 @@ static URLOpenHandler g_urlOpenHandler = nullptr;
 static std::vector<std::string> g_pendingUrlOpenPaths;
 static std::mutex g_urlOpenMutex;
 
+// App-reopen (the app is launched again while already running). On Linux this is driven by
+// single-instance forwarding: a second launch with no deep-link URL signals "reopen".
+static AppReopenHandler g_appReopenHandler = nullptr;
+static bool g_pendingReopen = false; // set if a reopen arrives before the handler registers
+
 static void deliverUrlToHandlerOrBuffer(const char* url) {
     if (!url) return;
     std::lock_guard<std::mutex> lock(g_urlOpenMutex);
@@ -90,6 +95,15 @@ static void deliverUrlToHandlerOrBuffer(const char* url) {
     } else {
         // Handler not registered yet — buffer it; setURLOpenHandler flushes on registration.
         g_pendingUrlOpenPaths.emplace_back(url);
+    }
+}
+
+static void deliverReopenOrBuffer() {
+    std::lock_guard<std::mutex> lock(g_urlOpenMutex);
+    if (g_appReopenHandler) {
+        g_appReopenHandler();
+    } else {
+        g_pendingReopen = true; // flushed when setAppReopenHandler registers
     }
 }
 
@@ -11774,6 +11788,15 @@ ELECTROBUN_EXPORT void electrobun_register_url_schemes(const char* schemesCsv, c
     (void)launcherPath;
 }
 
+// electrobun_register_file_associations - on Linux, file associations are registered at
+// install time by the self-extractor (shared-mime-info XML + `xdg-mime default`). This
+// export exists for API symmetry with Windows; the launcher does not call it on Linux.
+ELECTROBUN_EXPORT void electrobun_register_file_associations(const char* identifier, const char* extsCsv, const char* launcherPath) {
+    (void)identifier;
+    (void)extsCsv;
+    (void)launcherPath;
+}
+
 // ============================================================================
 // Single-instance / warm-launch deep-link forwarding (Linux)
 // ----------------------------------------------------------------------------
@@ -11785,6 +11808,24 @@ ELECTROBUN_EXPORT void electrobun_register_url_schemes(const char* schemesCsv, c
 // ============================================================================
 static constexpr size_t MAX_DEEP_LINK_URL_BYTES = 8 * 1024;
 static int g_singleInstanceSocketFd = -1;
+
+// Best-effort: raise and focus one of the app's top-level windows on a warm launch (deep
+// link / reopen forwarded from a second instance). Runs on the glib main-loop thread, so
+// touching g_x11_windows and Xlib here is safe.
+static void bringAppToForeground() {
+    for (auto& kv : g_x11_windows) {
+        X11Window* win = kv.second.get();
+        if (!win || !win->display || !win->window) continue;
+        XWindowAttributes attrs;
+        if (XGetWindowAttributes(win->display, win->window, &attrs) &&
+            attrs.map_state == IsViewable) {
+            XRaiseWindow(win->display, win->window);
+            XSetInputFocus(win->display, win->window, RevertToParent, CurrentTime);
+            XFlush(win->display);
+            return;
+        }
+    }
+}
 
 // Fill a sockaddr_un for the abstract-namespace address derived from instanceKey.
 // Returns the address length to pass to bind()/connect().
@@ -11822,7 +11863,15 @@ static gboolean onSingleInstanceConnection(GIOChannel* source, GIOCondition cond
         buf[total] = '\0';
         char* nl = static_cast<char*>(memchr(buf, '\n', total));
         if (nl) *nl = '\0';
-        deliverUrlToHandlerOrBuffer(buf);
+        // Wire format: a single leading kind byte, 'u' (URL, payload follows) or 'r' (reopen).
+        const char kind = buf[0];
+        if (kind == 'r') {
+            deliverReopenOrBuffer();
+            bringAppToForeground();
+        } else if (kind == 'u') {
+            deliverUrlToHandlerOrBuffer(buf + 1);
+            bringAppToForeground();
+        }
     }
     return TRUE; // keep watching for further connections
 }
@@ -11869,22 +11918,54 @@ ELECTROBUN_EXPORT void electrobun_single_instance_send_url(const char* instanceK
         usleep(100000); // 100ms
     }
     if (connected == 0) {
-        std::string payload(url);
-        const size_t nl = payload.find('\n');
-        if (nl != std::string::npos) payload.resize(nl);
-        if (payload.size() > MAX_DEEP_LINK_URL_BYTES - 1) {
-            payload.resize(MAX_DEEP_LINK_URL_BYTES - 1);
+        std::string url_str(url);
+        const size_t nl = url_str.find('\n');
+        if (nl != std::string::npos) url_str.resize(nl);
+        if (url_str.size() > MAX_DEEP_LINK_URL_BYTES - 2) {
+            url_str.resize(MAX_DEEP_LINK_URL_BYTES - 2);
         }
-        payload.push_back('\n');
+        // Wire format: 'u' kind byte + URL + newline (see onSingleInstanceConnection).
+        const std::string payload = "u" + url_str + "\n";
         const ssize_t written = write(fd, payload.data(), payload.size());
         (void)written;
     }
     close(fd);
 }
 
+// Signal the running primary that the app was launched again with no deep-link URL (reopen).
+ELECTROBUN_EXPORT void electrobun_single_instance_send_reopen(const char* instanceKey) {
+    if (!instanceKey) return;
+    const int fd = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (fd < 0) return;
+
+    struct sockaddr_un addr;
+    const socklen_t addrlen = buildAbstractSockAddr(&addr, instanceKey);
+
+    int connected = -1;
+    for (int i = 0; i < 50; i++) {
+        connected = connect(fd, reinterpret_cast<struct sockaddr*>(&addr), addrlen);
+        if (connected == 0) break;
+        usleep(100000); // 100ms
+    }
+    if (connected == 0) {
+        const char payload[] = "r\n";
+        const ssize_t written = write(fd, payload, sizeof(payload) - 1);
+        (void)written;
+    }
+    close(fd);
+}
+
+// setAppReopenHandler - registers the reopen handler and fires it immediately if a reopen
+// signal arrived before registration. Reopen is driven by single-instance forwarding.
 ELECTROBUN_EXPORT void setAppReopenHandler(void (*callback)()) {
-    (void)callback;
-    // Not supported on Linux - stub to prevent dlopen failure
+    bool pending = false;
+    {
+        std::lock_guard<std::mutex> lock(g_urlOpenMutex);
+        g_appReopenHandler = callback;
+        pending = g_pendingReopen;
+        g_pendingReopen = false;
+    }
+    if (pending && callback) callback();
 }
 
 ELECTROBUN_EXPORT void setDockIconVisible(bool visible) {

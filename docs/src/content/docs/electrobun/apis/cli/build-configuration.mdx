@@ -267,10 +267,14 @@ Electrobun.events.on("open-url", (e) => {
 
               <p><strong>Platform support:</strong></p>
               <ul>
-                <li>macOS: Fully supported. Generates `CFBundleDocumentTypes` in `Info.plist`.</li>
-                <li>Windows: Not yet supported</li>
-                <li>Linux: Not yet supported</li>
+                <li>macOS: Generates `CFBundleDocumentTypes` in `Info.plist`.</li>
+                <li>Windows: Per-extension ProgIDs are registered in the registry (HKCU) on first run.</li>
+                <li>Linux: A shared-mime-info XML is installed and registered with `xdg-mime` at install time.</li>
               </ul>
+
+              <Aside type="note">
+                <p>Opened files are delivered as `file://` URLs through the same `open-url` event as deep links. The per-type `icon` (an `.icns`) applies to macOS only. As with URL schemes, OS-routed file opening is validated in a packaged build, not `dev`.</p>
+              </Aside>
 
 ### Configuration
 

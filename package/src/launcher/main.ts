@@ -3,6 +3,7 @@ import { dlopen, suffix, ptr, toArrayBuffer } from "bun:ffi";
 import { existsSync, readFileSync, writeFileSync } from "fs";
 import { tmpdir } from "os";
 import { spawn } from "child_process";
+import { pathToFileURL, fileURLToPath } from "url";
 
 // Since main.js now runs from Resources, we need to find libraries in the MacOS directory
 const pathToMacOS = dirname(process.argv0); // bun is still in MacOS/bin directory
@@ -16,18 +17,30 @@ const absoluteCoreLibPath = resolve(coreLibPath);
 // Maximum accepted length for a deep-link URL (defense against oversized argv input).
 const MAX_DEEP_LINK_URL_LENGTH = 8 * 1024;
 
-// Extract a deep-link URL from process arguments (cold launch on Windows/Linux).
-// On Windows the OS invokes `"<launcher.exe>" "%1"` from the registry; on Linux it
-// invokes `launcher %u` from the .desktop file — in both cases the URL is a single argv
-// element. Returns the first argument whose scheme matches one of the app's registered
-// urlSchemes. The URL is treated as untrusted: only a registered scheme is accepted, the
-// length is bounded, and control characters are rejected before it is handed to the app.
-function extractDeepLinkFromArgv(
+// Return the lowercased extension of a path/URL (without the dot), or "" if none.
+function extensionOf(pathOrUrl: string): string {
+	const base = pathOrUrl.split(/[\\/]/).pop() ?? "";
+	const dot = base.lastIndexOf(".");
+	return dot > 0 ? base.slice(dot + 1).toLowerCase() : "";
+}
+
+// Extract a launch URL from process arguments (cold launch on Windows/Linux).
+// On Windows the OS invokes `"<launcher.exe>" "%1"` from the registry / file association;
+// on Linux it invokes `launcher %u` from the .desktop file — in both cases the argument is
+// a single argv element. Handles two shapes:
+//   - a custom URL scheme deep link (`myapp://...`), matched against the registered schemes;
+//   - a file opened via a registered file association, delivered as a path or `file://` URL,
+//     matched against the associated extensions and normalized to a `file://` URL.
+// The argument is treated as untrusted: only registered schemes / extensions are accepted,
+// length is bounded, and control characters are rejected before it reaches app JS.
+function extractLaunchUrlFromArgv(
 	argv: string[],
 	urlSchemes: string[],
+	fileExtensions: string[],
 ): string | null {
-	if (!urlSchemes || urlSchemes.length === 0) return null;
-	const registered = new Set(urlSchemes.map((s) => s.toLowerCase()));
+	const registeredSchemes = new Set(urlSchemes.map((s) => s.toLowerCase()));
+	const exts = new Set(fileExtensions.map((e) => e.toLowerCase()));
+	if (registeredSchemes.size === 0 && exts.size === 0) return null;
 	// argv[0] is the launcher executable; user-supplied arguments follow.
 	for (let i = 1; i < argv.length; i++) {
 		const arg = argv[i];
@@ -35,9 +48,25 @@ function extractDeepLinkFromArgv(
 		// eslint-disable-next-line no-control-regex
 		if (/[\u0000-\u001f\u007f]/.test(arg)) continue;
 		const match = arg.match(/^([a-zA-Z][a-zA-Z0-9+.\-]*):\/\//);
-		if (!match) continue;
-		if (registered.has(match[1]!.toLowerCase())) {
-			return arg;
+		if (match) {
+			const scheme = match[1]!.toLowerCase();
+			// Custom URL scheme deep link.
+			if (registeredSchemes.has(scheme)) return arg;
+			// A file:// URL from the OS — accept if its extension is associated.
+			if (scheme === "file" && exts.size > 0) {
+				try {
+					if (exts.has(extensionOf(fileURLToPath(arg)))) return arg;
+				} catch {
+					/* not a valid file URL — ignore */
+				}
+			}
+			continue;
+		}
+
+		// Not a URL: a plain file path from a file association. Require the extension to be
+		// associated and the file to exist, then normalize to a file:// URL.
+		if (exts.size > 0 && exts.has(extensionOf(arg)) && existsSync(arg)) {
+			return pathToFileURL(arg).href;
 		}
 	}
 	return null;
@@ -50,6 +79,7 @@ function main() {
 	let identifier = "";
 	let name = "";
 	let urlSchemes: string[] = [];
+	let fileExtensions: string[] = [];
 	let singleInstance = false;
 	try {
 		const pathToLauncherBin = process.argv0;
@@ -74,6 +104,11 @@ function main() {
 			}
 			if (Array.isArray(versionInfo.urlSchemes)) {
 				urlSchemes = versionInfo.urlSchemes.filter(
+					(s: unknown): s is string => typeof s === "string",
+				);
+			}
+			if (Array.isArray(versionInfo.fileExtensions)) {
+				fileExtensions = versionInfo.fileExtensions.filter(
 					(s: unknown): s is string => typeof s === "string",
 				);
 			}
@@ -141,6 +176,11 @@ function main() {
 			args: ["cstring", "cstring"],
 			returns: "void",
 		},
+		// First-run file-association registration (Windows registry). No-op elsewhere.
+		electrobun_register_file_associations: {
+			args: ["cstring", "cstring", "cstring"],
+			returns: "void",
+		},
 		// Single-instance: acquire returns true for the primary (first) instance, false for
 		// a secondary. send_url forwards a deep-link URL from a secondary to the primary.
 		electrobun_single_instance_acquire: {
@@ -149,6 +189,11 @@ function main() {
 		},
 		electrobun_single_instance_send_url: {
 			args: ["cstring", "cstring"],
+			returns: "void",
+		},
+		// Signal the running primary that the app was relaunched with no URL (reopen).
+		electrobun_single_instance_send_reopen: {
+			args: ["cstring"],
 			returns: "void",
 		},
 	} as const;
@@ -185,23 +230,28 @@ function main() {
 	// single-instance for bundled apps and routes deep links via the OS, so it is skipped.
 	if (process.platform !== "darwin" && singleInstance) {
 		const instanceKey = `electrobun.${identifier}.${channel}`;
-		const instanceKeyPtr = ptr(
-			new Uint8Array(Buffer.from(instanceKey + "\0", "utf8")),
+		// Keep the backing buffer referenced by name so it isn't GC'd between FFI calls.
+		const instanceKeyBytes = new Uint8Array(
+			Buffer.from(instanceKey + "\0", "utf8"),
 		);
 		const isPrimary = lib.symbols.electrobun_single_instance_acquire(
-			instanceKeyPtr,
+			ptr(instanceKeyBytes),
 		);
 		if (!isPrimary) {
-			const forwardUrl = extractDeepLinkFromArgv(process.argv, urlSchemes);
+			const forwardUrl = extractLaunchUrlFromArgv(process.argv, urlSchemes, fileExtensions);
 			if (forwardUrl) {
 				console.log(`[LAUNCHER] Forwarding deep link to running instance`);
 				lib.symbols.electrobun_single_instance_send_url(
-					ptr(new Uint8Array(Buffer.from(instanceKey + "\0", "utf8"))),
+					ptr(instanceKeyBytes),
 					ptr(new Uint8Array(Buffer.from(forwardUrl + "\0", "utf8"))),
 				);
 			} else {
+				// No URL: ask the running instance to surface itself (reopen).
 				console.log(
-					`[LAUNCHER] Another instance is already running; exiting`,
+					`[LAUNCHER] Another instance is already running; requesting reopen`,
+				);
+				lib.symbols.electrobun_single_instance_send_reopen(
+					ptr(instanceKeyBytes),
 				);
 			}
 			process.exit(0);
@@ -344,12 +394,27 @@ ${fileData.toString("utf8")}
 		}
 	}
 
+	// First-run file-association registration (Windows): register per-extension ProgIDs so
+	// double-clicking an associated file opens this app. Self-healing (current launcher path).
+	// macOS registers via Info.plist; Linux registers at install time via MIME + xdg-mime.
+	if (process.platform === "win32" && fileExtensions.length > 0) {
+		try {
+			lib.symbols.electrobun_register_file_associations(
+				ptr(new Uint8Array(Buffer.from(identifier + "\0", "utf8"))),
+				ptr(new Uint8Array(Buffer.from(fileExtensions.join(",") + "\0", "utf8"))),
+				ptr(new Uint8Array(Buffer.from(process.execPath + "\0", "utf8"))),
+			);
+		} catch (err) {
+			console.error(`[LAUNCHER] File association registration failed:`, err);
+		}
+	}
+
 	// Cold-launch deep link (Windows/Linux): if the OS launched us with a registered
 	// scheme URL as an argument, hand it to the native wrapper. It is buffered there and
 	// delivered to the app's "open-url" listener once the worker registers its handler.
 	// macOS receives deep links through the app delegate (application:openURLs:) instead.
 	if (process.platform !== "darwin") {
-		const launchUrl = extractDeepLinkFromArgv(process.argv, urlSchemes);
+		const launchUrl = extractLaunchUrlFromArgv(process.argv, urlSchemes, fileExtensions);
 		if (launchUrl) {
 			console.log(`[LAUNCHER] Cold-launch deep link received`);
 			lib.symbols.electrobun_set_launch_url(
