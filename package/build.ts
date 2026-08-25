@@ -347,12 +347,12 @@ async function runZigBuild(
 		return;
 	}
 
-	const projectPath = join("src", projectDir);
-	if (CHANNEL === "release") {
-		await $`cd ${projectPath} && ../../vendors/zig/zig build ${optimizeArgs} ${zigArgs}`;
-	} else {
-		await $`cd ${projectPath} && ../../vendors/zig/zig build ${zigArgs}`;
-	}
+	const projectPath = join(process.cwd(), "src", projectDir);
+	runInherited(
+		PATH.zig.BIN,
+		["build", ...optimizeArgs, ...zigArgs],
+		projectPath,
+	);
 }
 
 function findWindowsExecutable(name: string) {
