@@ -111,7 +111,7 @@ test("release bumps keep the thin npm bootstrap on the product version", () => {
 	);
 	const original = JSON.parse(source);
 	const updated = JSON.parse(updateNpmBootstrapVersion(source, "2.3.4-beta.5"));
-	assert.equal(updated.name, "electrobun");
+	assert.equal(updated.name, "@suaveplan/electrobun-ext");
 	assert.equal(updated.version, "2.3.4-beta.5");
 	// Only the single dependency-free bootstrap version moves.
 	assert.equal(updated.optionalDependencies, undefined);

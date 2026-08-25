@@ -28,8 +28,10 @@ export function updateNpmBootstrapVersion(source, version) {
 	} catch (error) {
 		throw new Error(`Could not parse npm bootstrap package.json: ${error.message}`);
 	}
-	if (manifest?.name !== "electrobun") {
-		throw new Error("npm bootstrap package name must be electrobun");
+	if (manifest?.name !== "@suaveplan/electrobun-ext") {
+		throw new Error(
+			"npm bootstrap package name must be @suaveplan/electrobun-ext",
+		);
 	}
 	manifest.version = version;
 	return `${JSON.stringify(manifest, null, "\t")}\n`;
