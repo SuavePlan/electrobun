@@ -275,6 +275,10 @@ jobs:
           MACOS_CERTIFICATE: ${{ secrets.MACOS_CERTIFICATE }}
           MACOS_CERTIFICATE_PWD: ${{ secrets.MACOS_CERTIFICATE_PWD }}
         run: |
+          if [[ -z "$MACOS_CERTIFICATE" || -z "$MACOS_CERTIFICATE_PWD" ]]; then
+            echo "Apple signing certificate is not configured; continuing with unsigned prerelease artifacts."
+            exit 0
+          fi
           security delete-keychain build.keychain || true
           echo $MACOS_CERTIFICATE | base64 --decode > certificate.p12
           security create-keychain -p actions build.keychain
