@@ -8,6 +8,12 @@ const matrixVariant = readKitchenVariant(process.env);
 const mainProcess = matrixVariant?.mainProcess ?? "cottontail";
 const defaultRenderer = matrixVariant?.renderer ?? "native";
 const bundleCEF = matrixVariant ? defaultRenderer === "cef" : true;
+const macSigningConfigured = [
+	"ELECTROBUN_DEVELOPER_ID",
+	"ELECTROBUN_APPLEID",
+	"ELECTROBUN_APPLEIDPASS",
+	"ELECTROBUN_TEAMID",
+].every((name) => Boolean(process.env[name]));
 const variantKey = matrixVariant ? kitchenVariantKey(matrixVariant) : null;
 const appName = variantKey
 	? `Electrobun Kitchen Sink (${variantKey})`
@@ -196,8 +202,8 @@ export default {
 				"views/playgrounds/fullsize-frame-repro/index.html",
 		},
 		mac: {
-			codesign: true,
-			notarize: true,
+			codesign: macSigningConfigured,
+			notarize: macSigningConfigured,
 			bundleCEF,
 			defaultRenderer,
 			bundleWGPU: true,
