@@ -2409,7 +2409,7 @@ export fn runNativeEventLoopTick(timeout_ms: c_int) void {
 // native wrapper, which buffers it until the Bun worker registers its open-url handler.
 export fn electrobun_set_launch_url(url: [*:0]const u8) void {
     clearLastError();
-    const SetLaunchUrlFn = *const fn ([*:0]const u8) callconv(.C) void;
+    const SetLaunchUrlFn = *const fn ([*:0]const u8) callconv(.c) void;
     const set_launch_url = lookupNativeSymbol(SetLaunchUrlFn, "electrobun_set_launch_url") orelse return;
     set_launch_url(url);
 }
@@ -2419,7 +2419,7 @@ export fn electrobun_set_launch_url(url: [*:0]const u8) void {
 // (registered via Info.plist at build time).
 export fn electrobun_register_url_schemes(schemes_csv: [*:0]const u8, launcher_path: [*:0]const u8) void {
     clearLastError();
-    const RegisterFn = *const fn ([*:0]const u8, [*:0]const u8) callconv(.C) void;
+    const RegisterFn = *const fn ([*:0]const u8, [*:0]const u8) callconv(.c) void;
     const register_url_schemes = lookupNativeSymbol(RegisterFn, "electrobun_register_url_schemes") orelse return;
     register_url_schemes(schemes_csv, launcher_path);
 }
@@ -2428,7 +2428,7 @@ export fn electrobun_register_url_schemes(schemes_csv: [*:0]const u8, launcher_p
 // the registry on startup. No-op on Linux (install-time) / macOS (Info.plist at build time).
 export fn electrobun_register_file_associations(identifier: [*:0]const u8, exts_csv: [*:0]const u8, launcher_path: [*:0]const u8) void {
     clearLastError();
-    const RegisterFn = *const fn ([*:0]const u8, [*:0]const u8, [*:0]const u8) callconv(.C) void;
+    const RegisterFn = *const fn ([*:0]const u8, [*:0]const u8, [*:0]const u8) callconv(.c) void;
     const register_file_associations = lookupNativeSymbol(RegisterFn, "electrobun_register_file_associations") orelse return;
     register_file_associations(identifier, exts_csv, launcher_path);
 }
@@ -2438,7 +2438,7 @@ export fn electrobun_register_file_associations(identifier: [*:0]const u8, exts_
 // launches. The primary sets up an IPC receiver so secondaries can forward deep-link URLs.
 export fn electrobun_single_instance_acquire(instance_key: [*:0]const u8) bool {
     clearLastError();
-    const AcquireFn = *const fn ([*:0]const u8) callconv(.C) bool;
+    const AcquireFn = *const fn ([*:0]const u8) callconv(.c) bool;
     const acquire = lookupNativeSymbol(AcquireFn, "electrobun_single_instance_acquire") orelse return true;
     return acquire(instance_key);
 }
@@ -2446,7 +2446,7 @@ export fn electrobun_single_instance_acquire(instance_key: [*:0]const u8) bool {
 // Single-instance: forward a deep-link URL from a secondary instance to the running primary.
 export fn electrobun_single_instance_send_url(instance_key: [*:0]const u8, url: [*:0]const u8) void {
     clearLastError();
-    const SendUrlFn = *const fn ([*:0]const u8, [*:0]const u8) callconv(.C) void;
+    const SendUrlFn = *const fn ([*:0]const u8, [*:0]const u8) callconv(.c) void;
     const send_url = lookupNativeSymbol(SendUrlFn, "electrobun_single_instance_send_url") orelse return;
     send_url(instance_key, url);
 }
@@ -2455,7 +2455,7 @@ export fn electrobun_single_instance_send_url(instance_key: [*:0]const u8, url: 
 // (reopen). The primary emits the "reopen" event and raises its window.
 export fn electrobun_single_instance_send_reopen(instance_key: [*:0]const u8) void {
     clearLastError();
-    const SendReopenFn = *const fn ([*:0]const u8) callconv(.C) void;
+    const SendReopenFn = *const fn ([*:0]const u8) callconv(.c) void;
     const send_reopen = lookupNativeSymbol(SendReopenFn, "electrobun_single_instance_send_reopen") orelse return;
     send_reopen(instance_key);
 }
