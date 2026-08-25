@@ -64,7 +64,7 @@
 	"homepage": "https://electrobun.dev",
 	"repository": {
 		"type": "git",
-		"url": "git+https://github.com/blackboardsh/electrobun.git"
+		"url": "git+https://github.com/SuavePlan/electrobun-ext.git"
 	},
 	"scripts": {
 		"build:local": "node scripts/build-local.js"

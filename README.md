@@ -43,9 +43,9 @@ for the generated project's `hutch` tasks. It does not carry or own the
 Electrobun runtime or SDKs:
 
 ```bash
-npx electrobun init
+npx @suaveplan/electrobun-ext init
 # or
-bunx electrobun init
+bunx @suaveplan/electrobun-ext init
 ```
 
 Hutch's built-in npm-compatible resolver installs JavaScript dependencies by
@@ -195,7 +195,7 @@ PipeWire, and the `libpipewire-0.3.so.0` runtime library (provided by
 ### First-time Setup
 
 ```bash
-git clone --recurse-submodules https://github.com/blackboardsh/electrobun.git
+git clone --recurse-submodules https://github.com/SuavePlan/electrobun-ext.git
 cd electrobun/package
 npm ci
 hutch dev:clean

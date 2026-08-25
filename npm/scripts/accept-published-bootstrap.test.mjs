@@ -35,13 +35,13 @@ test("accepts only an exact matching release tag and monotonic npm channel", () 
 		validateReleaseCoordinates({
 			distTag: "beta",
 			releaseTag: "v2.3.4-beta.5",
-			repository: "blackboardsh/electrobun",
+			repository: "SuavePlan/electrobun-ext",
 			version: "2.3.4-beta.5",
 		}),
 		{
 			distTag: "beta",
 			releaseTag: "v2.3.4-beta.5",
-			repository: "blackboardsh/electrobun",
+			repository: "SuavePlan/electrobun-ext",
 			version: "2.3.4-beta.5",
 		},
 	);
@@ -49,7 +49,7 @@ test("accepts only an exact matching release tag and monotonic npm channel", () 
 		validateReleaseCoordinates({
 			distTag: "latest",
 			releaseTag: "v2.3.4",
-			repository: "blackboardsh/electrobun",
+			repository: "SuavePlan/electrobun-ext",
 			version: "2.3.4",
 		}),
 	);
@@ -211,7 +211,7 @@ test("accepts only the exact public same-version Hutch asset matrix", () => {
 			archive: {
 				sha256: "a".repeat(64),
 				size: 123,
-				url: `https://github.com/blackboardsh/electrobun/releases/download/v${version}/electrobun-hutch-${platformKey}.tar.gz`,
+				url: `https://github.com/SuavePlan/electrobun-ext/releases/download/v${version}/electrobun-hutch-${platformKey}.tar.gz`,
 			},
 		};
 	}

@@ -25,7 +25,7 @@ function gitStdout(args) {
 }
 
 test("shares the product release version and remains dependency-free", () => {
-	assert.equal(manifest.name, "electrobun");
+	assert.equal(manifest.name, "@suaveplan/electrobun-ext");
 	assert.equal(manifest.version, productSourceManifest.version);
 	// One bin, one door: raw Hutch access stays with the machine install
 	// (and the `hutch` bin name stays free for a future standalone package).

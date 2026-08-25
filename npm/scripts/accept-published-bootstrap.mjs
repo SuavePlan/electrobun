@@ -21,7 +21,7 @@ import { compareSemver } from "./check-published-bootstrap.mjs";
 
 const defaultRegistry = "https://registry.npmjs.org";
 const publicReleasesBaseUrl =
-	"https://github.com/blackboardsh/electrobun/releases/download";
+	"https://github.com/SuavePlan/electrobun-ext/releases/download";
 export const MIGRATION_BASELINE_VERSION = "1.18.1";
 const commandTimeoutMs = 5 * 60_000;
 const publicationTimeoutMs = 3 * 60_000;
@@ -91,9 +91,9 @@ export function validateReleaseCoordinates({
 	if (typeof repository !== "string" || !repositoryPattern.test(repository)) {
 		fail(`invalid GitHub repository ${JSON.stringify(repository)}`);
 	}
-	if (repository !== "blackboardsh/electrobun") {
+	if (repository.toLowerCase() !== "suaveplan/electrobun-ext") {
 		fail(
-			`acceptance must exercise the public blackboardsh/electrobun release, got ${repository}`,
+			`acceptance must exercise the public SuavePlan/electrobun-ext release, got ${repository}`,
 		);
 	}
 	return {

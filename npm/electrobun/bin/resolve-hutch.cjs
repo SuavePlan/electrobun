@@ -40,7 +40,7 @@ const CACHE_LOCK_RELEASED_FILENAME = "released.json";
 const CACHE_LOCK_ORPHAN_FILENAME = "orphaned.json";
 const defaultInstallerBaseUrl = "https://hutch.blackboard.sh/hutch";
 const defaultReleasesBaseUrl =
-	"https://github.com/blackboardsh/electrobun/releases/download";
+	"https://github.com/SuavePlan/electrobun-ext/releases/download";
 const maxInstallerBytes = 1024 * 1024;
 const maxArtifactIndexBytes = 1024 * 1024;
 const maxArchiveBytes = 64 * 1024 * 1024;

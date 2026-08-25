@@ -1,6 +1,6 @@
 # Electrobun npm bootstrap
 
-The dependency-free `electrobun` npm package is a small Hutch entry point for
+The dependency-free `@suaveplan/electrobun-ext` npm package is a small Hutch entry point for
 npm, pnpm, Yarn, and Bun users. It contains no Electrobun runtime, SDK, or
 platform-specific npm dependency. On first use, the `electrobun` command reads
 the `hutch-artifacts.json` index for its exact version, downloads the host's
@@ -14,13 +14,13 @@ init itself still runs through the exact private cache.
 Create a project from the current stable template catalog:
 
 ```sh
-npx electrobun init
+npx @suaveplan/electrobun-ext init
 ```
 
 Use the beta catalog only when you ask for it:
 
 ```sh
-npx electrobun init --beta
+npx @suaveplan/electrobun-ext init --beta
 ```
 
 The npm bootstrap supplies the exact Hutch and Electrobun defaults paired with
