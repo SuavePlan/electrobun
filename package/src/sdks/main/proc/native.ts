@@ -1094,7 +1094,7 @@ export const native = (() => {
 				returns: FFIType.void,
 			},
 
-			// URL scheme handler (macOS only)
+			// URL scheme handler (deep links) — implemented on macOS, Windows, and Linux
 			setURLOpenHandler: {
 				args: [FFIType.function], // handler callback
 				returns: FFIType.void,
@@ -2998,9 +2998,9 @@ if (native) {
 		},
 		{ args: [FFIType.cstring], returns: "void", threadsafe: true },
 	);
-	if (process.platform === "darwin") {
-		native_.symbols.setURLOpenHandler(urlOpenCallback);
-	}
+	// Deep-link delivery is wired on all platforms (macOS via the app delegate,
+	// Windows/Linux via the launcher's cold-launch capture + single-instance forwarding).
+	native_.symbols.setURLOpenHandler(urlOpenCallback);
 
 	const appReopenCallback = new JSCallback(
 		() => {
@@ -3013,9 +3013,9 @@ if (native) {
 		},
 		{ args: [], returns: "void", threadsafe: true },
 	);
-	if (process.platform === "darwin") {
-		native_.symbols.setAppReopenHandler(appReopenCallback);
-	}
+	// Reopen is delivered on all platforms: macOS via applicationShouldHandleReopen,
+	// Windows/Linux via single-instance forwarding (a second launch with no deep-link URL).
+	native_.symbols.setAppReopenHandler(appReopenCallback);
 
 	const quitRequestedCallback = new JSCallback(
 		() => {

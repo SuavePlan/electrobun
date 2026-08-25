@@ -220,9 +220,10 @@ Electrobun.events.on("before-quit", (event) => {
 });
 ```
 
-On macOS, custom schemes and associated files arrive through `open-url`; files
-use `file://` URLs. Configure them with `app.urlSchemes` and
-`app.fileAssociations`.
+On macOS, Windows, and Linux, custom schemes and associated files arrive
+through `open-url`; files use `file://` URLs. Configure them with
+`app.urlSchemes` and `app.fileAssociations`. Windows and Linux use
+single-instance forwarding to deliver secondary launches to a running app.
 
 ## Window events
 

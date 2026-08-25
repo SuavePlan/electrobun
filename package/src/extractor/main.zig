@@ -2242,7 +2242,9 @@ fn rewriteDesktopEntry(
             defer allocator.free(escaped_launcher_path);
             try result.appendSlice(allocator, "Exec=\"");
             try result.appendSlice(allocator, escaped_launcher_path);
-            try result.appendSlice(allocator, "\"\n");
+            // Preserve the URI field code so desktop launches can pass deep links and
+            // associated files through to the launcher.
+            try result.appendSlice(allocator, "\" %u\n");
         } else if (std.mem.startsWith(u8, line, "Icon=")) {
             if (icon_path) |path| {
                 try result.appendSlice(allocator, "Icon=");

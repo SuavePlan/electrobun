@@ -74,13 +74,16 @@ external-bundler aliases.
 | `identifier` | `string` | Platform application identifier, normally reverse-DNS. |
 | `version` | `string` | Application version written into release metadata. |
 | `description` | `string?` | Human-readable description. |
-| `urlSchemes` | `string[]?` | Custom URL schemes on macOS. |
-| `fileAssociations` | `FileAssociation[]?` | Document associations on macOS. |
+| `urlSchemes` | `string[]?` | Custom URL schemes on macOS, Windows, and Linux. |
+| `fileAssociations` | `FileAssociation[]?` | Document associations on macOS, Windows, and Linux. |
+| `singleInstance` | `boolean?` | Forward secondary launches on Windows and Linux; defaults on when URL schemes are configured. |
 
 ### URL Schemes
 
-Custom URL schemes are currently registered on macOS. Install the built app
-in `/Applications` or `~/Applications` so Launch Services can register it.
+Custom URL schemes are registered through Launch Services on macOS, the
+current-user registry on Windows, and the installed desktop entry on Linux.
+On macOS, install the built app in `/Applications` or `~/Applications` so
+Launch Services can register it.
 
 ```typescript
 import type { ElectrobunConfig } from "electrobun";
@@ -108,8 +111,8 @@ Electrobun.events.on("open-url", (event) => {
 
 ### File Associations
 
-File associations are currently packaged on macOS. Extensions do not include
-the leading dot. An optional icon must be an `.icns` source file.
+File associations are supported on macOS, Windows, and Linux. Extensions do
+not include the leading dot. The optional `.icns` icon applies to macOS.
 
 ```typescript
 import type { ElectrobunConfig } from "electrobun";
@@ -144,7 +147,9 @@ Electrobun.events.on("open-url", (event) => {
 });
 ```
 
-Windows and Linux URL schemes and file associations are not yet implemented.
+On Windows and Linux, secondary launches forward deep links and file opens to
+the running application when `singleInstance` is enabled. Packaged builds are
+required to test operating-system registration.
 
 ## Main Process
 

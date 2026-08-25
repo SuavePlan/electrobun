@@ -9827,3 +9827,36 @@ extern "C" bool isWindowVisibleOnAllWorkspaces(NSWindow *window) {
     });
     return result;
 }
+
+// These launcher-facing entry points are implemented by the Windows and Linux
+// wrappers. macOS registers and routes URLs through Launch Services and already
+// enforces one running bundled-app instance, so the portable Core ABI uses no-op
+// counterparts here.
+extern "C" void electrobun_set_launch_url(const char* url) {
+    (void)url;
+}
+
+extern "C" void electrobun_register_url_schemes(const char* schemesCsv, const char* launcherPath) {
+    (void)schemesCsv;
+    (void)launcherPath;
+}
+
+extern "C" void electrobun_register_file_associations(const char* identifier, const char* extsCsv, const char* launcherPath) {
+    (void)identifier;
+    (void)extsCsv;
+    (void)launcherPath;
+}
+
+extern "C" bool electrobun_single_instance_acquire(const char* instanceKey) {
+    (void)instanceKey;
+    return true;
+}
+
+extern "C" void electrobun_single_instance_send_url(const char* instanceKey, const char* url) {
+    (void)instanceKey;
+    (void)url;
+}
+
+extern "C" void electrobun_single_instance_send_reopen(const char* instanceKey) {
+    (void)instanceKey;
+}
