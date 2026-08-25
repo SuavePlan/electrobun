@@ -41,7 +41,9 @@ function registryBaseUrl(value) {
 export async function checkPublishedBootstrap(options) {
 	const manifestPath = resolve(options.manifestPath);
 	const manifest = JSON.parse(readFileSync(manifestPath, "utf8"));
-	if (manifest.name !== "electrobun") fail("manifest package name must be electrobun");
+	if (!new Set(["electrobun", "@suaveplan/electrobun-ext"]).has(manifest.name)) {
+		fail("manifest package name must be an approved Electrobun bootstrap");
+	}
 	if (typeof manifest.version !== "string" || !strictSemver.test(manifest.version)) {
 		fail(`manifest version is not exact SemVer: ${JSON.stringify(manifest.version)}`);
 	}
